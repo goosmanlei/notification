@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+.swiftpm/
+build/
+dist/
+.codex-project/
+.codex/
+*.xcuserstate
+*.log
+.env
+.env.*
+__pycache__/
+*.py[cod]
