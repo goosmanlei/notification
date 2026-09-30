@@ -9,7 +9,7 @@ if CommandLine.arguments.contains("--codex-hook") {
         data.append(part)
     }
     if var event = CodexHook.parse(data) {
-        if event.action == .show { event.notice?.tmux = TmuxBridge.installed()?.capture() }
+        if event.action == .show { event.notice?.tmux = TmuxBridge.installed()?.capture(sessionID: event.sessionID) }
         try? EventInbox.write(event)
     }
     exit(0)

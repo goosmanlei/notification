@@ -145,20 +145,25 @@ final class NotificationCoreTests {
             try? FileManager.default.removeItem(at: directory)
         }
         func run(_ arguments: [String]) throws -> String {
-            try unwrap(LocalCommand.run(bridge.executable, ["-S", socket] + arguments, timeout: 1))
+            guard let output = LocalCommand.run(bridge.executable, ["-S", socket] + arguments, timeout: 1) else {
+                throw NSError(domain: "CoreChecks", code: 2, userInfo: [NSLocalizedDescriptionKey: "tmux failed: \(arguments)"])
+            }
+            return output
         }
         _ = try run(["-f", "/dev/null", "new-session", "-d", "-s", "unit-session", "-n", "work 'quoted'; literal", "/bin/sleep 60"])
         let identity = try run(["display-message", "-p", "#{pid}\n#{session_id}\n#{pane_id}"]).split(separator: "\n").map(String.init)
         checkEqual(identity.count, 3)
         let environment = ["TMUX": "\(socket),\(identity[0]),\(identity[1].dropFirst())", "TMUX_PANE": identity[2]]
-        let original = try unwrap(bridge.capture(environment: environment))
+        let panePID = try unwrap(Int32(try run(["display-message", "-p", "-t", identity[2], "#{pane_pid}"]).trimmingCharacters(in: .whitespacesAndNewlines)))
+        let original = try unwrap(bridge.capture(environment: environment, processID: panePID))
         checkEqual(original.sessionName, "unit-session")
         checkEqual(original.windowName, "work 'quoted'; literal")
         checkEqual(original.label, "unit-session/work 'quoted'; literal/pane-0")
         checkEqual(original.socketPath, socket)
         checkEqual(try JSONDecoder().decode(TmuxContext.self, from: JSONEncoder().encode(original)), original)
         checkNil(bridge.capture(environment: [:]))
-        checkNil(bridge.capture(environment: ["TMUX": environment["TMUX"]!, "TMUX_PANE": "%99999999"]))
+        // A daemon outside the pane must never inherit a false origin from TMUX_PANE.
+        checkNil(bridge.capture(environment: environment, processID: 1))
         _ = try run(["rename-window", "-t", original.windowID, "renamed"])
         let other = try run(["split-window", "-d", "-t", original.paneID, "-P", "-F", "#{pane_id}", "/bin/sleep 60"]).trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try run(["select-pane", "-t", other])
@@ -205,6 +210,25 @@ final class NotificationCoreTests {
         var stale = original; stale.serverPID += 1
         checkNil(bridge.refreshed(stale))
         checkThrows(try bridge.select(stale))
+
+        // A second CLI connected to a shared server has its own current session in the pane title.
+        let fakeCLI = directory.appendingPathComponent("codex")
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: "/bin/sleep"), to: fakeCLI)
+        _ = try unwrap(LocalCommand.run(URL(fileURLWithPath: "/usr/bin/codesign"), ["--force", "--sign", "-", fakeCLI.path], timeout: 2))
+        let remote = try run(["new-window", "-d", "-t", original.sessionID, "-n", "remote", "-P", "-F", "#{pane_id}", "\(TmuxBridge.shellQuote(fakeCLI.path)) 60"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let thread = "12345678-1234-5678-90ab-cdef12345678"
+        _ = try run(["select-pane", "-t", remote, "-T", "project | Test | \(thread.prefix(26))... | Context 77% left"])
+        let remoteContext = try unwrap(bridge.capture(sessionID: thread, environment: environment, processID: 1))
+        checkEqual(remoteContext.paneID, remote)
+        checkNotEqual(remoteContext.paneID, original.paneID)
+        checkNil(bridge.capture(sessionID: UUID().uuidString, environment: environment, processID: 1))
+        _ = try run(["select-pane", "-t", remote, "-T", "project | \(thread.prefix(8))..."])
+        checkNil(bridge.capture(sessionID: thread, environment: environment, processID: 1))
+        _ = try run(["select-pane", "-t", remote, "-T", "project | \(thread)"])
+        checkEqual(bridge.capture(sessionID: thread, environment: environment, processID: 1)?.paneID, remote)
+        let duplicate = try run(["new-window", "-d", "-t", original.sessionID, "-n", "duplicate", "-P", "-F", "#{pane_id}", "\(TmuxBridge.shellQuote(fakeCLI.path)) 60"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try run(["select-pane", "-t", duplicate, "-T", "project | \(thread)"])
+        checkNil(bridge.capture(sessionID: thread, environment: environment, processID: 1))
         _ = try run(["kill-pane", "-t", original.paneID])
         checkNil(bridge.refreshed(original))
         checkThrows(try bridge.select(original))
@@ -235,13 +259,17 @@ private func checkNil<T>(_ value: T?, file: StaticString = #filePath, line: UInt
 private func checkThrows<T>(_ expression: @autoclosure () throws -> T, file: StaticString = #filePath, line: UInt = #line) {
     do { _ = try expression(); fail("Expected error", file: file, line: line) } catch { }
 }
-private func unwrap<T>(_ value: T?) throws -> T {
-    guard let value else { throw NSError(domain: "CoreChecks", code: 1) }
+private func unwrap<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) throws -> T {
+    guard let value else { throw NSError(domain: "CoreChecks", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing value at \(file):\(line)"]) }
     return value
 }
 
 @main struct RunChecks {
     static func main() {
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--locate-tmux" {
+            print(TmuxBridge.installed()?.capture(sessionID: CommandLine.arguments[2])?.label ?? "unresolved")
+            return
+        }
         let suite = NotificationCoreTests()
         let tests: [(String, () throws -> Void)] = [
             ("payload parsing and dismissal deduplication", suite.testPayloadChangesAndDismissalDeduplication),

@@ -13,14 +13,17 @@ public struct Notice: Codable, Equatable, Identifiable {
     public var sessionID: String?
     public var context: String?
     public var tmux: TmuxContext?
+    public var notificationIdentifier: String?
     public var requiresAction: Bool { kind != .notification }
 
     public init(id: String = UUID().uuidString, source: String, title: String, body: String,
                 kind: Kind = .notification, createdAt: Date = Date(), bundleID: String? = nil,
-                sessionID: String? = nil, context: String? = nil, tmux: TmuxContext? = nil) {
+                sessionID: String? = nil, context: String? = nil, tmux: TmuxContext? = nil,
+                notificationIdentifier: String? = nil) {
         self.id = id; self.source = source; self.title = title; self.body = body
         self.kind = kind; self.createdAt = createdAt; self.bundleID = bundleID
         self.sessionID = sessionID; self.context = context; self.tmux = tmux
+        self.notificationIdentifier = notificationIdentifier
     }
 }
 
@@ -48,6 +51,6 @@ public enum PayloadParser {
         return Notice(id: "system:\(recordID):\(signature)", source: bundleID ?? "系统通知",
                       title: String(title.prefix(200)),
                       body: text.isEmpty ? "该应用未提供可显示的通知内容" : String(text.prefix(2000)),
-                      bundleID: bundleID)
+                      bundleID: bundleID, notificationIdentifier: request["iden"] as? String)
     }
 }
