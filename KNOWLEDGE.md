@@ -17,6 +17,7 @@
 ## 维护入口
 
 - 公开 GitHub 仓库：[goosmanlei/notification](https://github.com/goosmanlei/notification)。2026-09-30 通过 GitHub CLI 创建。
+- 安装与后续更新统一部署到 `/Applications/Notification.app`，Codex hooks 默认引用该位置；用户于 2026-09-30 指定。
 - 实现选择 Swift / AppKit 菜单栏应用，SwiftUI 绘制浮层，SQLite 只读观察系统通知，Codex 官方 hooks 提供人工介入信号；详见 [技术说明](docs/design.md)。
 
 ## 技术依据

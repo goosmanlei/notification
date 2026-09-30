@@ -10,10 +10,10 @@
 
 - 六组核心检查通过：二进制 plist 解析与去重、数据库初次基线与新增/更新、缺失数据库不被创建、审批生命周期与命令不落盘、同步/异步提问生命周期、私有收件目录与事件过期。
 - 两组 hooks 安装器检查通过：保留其他 hooks、重复安装幂等、只移除本安装的条目。
-- 发布构建、Info.plist 校验及本地临时签名校验通过；最终应用安装到用户 `~/Applications/Notification.app`。
+- 发布构建、Info.plist 校验及本地临时签名校验通过。用户将应用移至 `/Applications/Notification.app` 后，核对可执行文件 SHA-256 与 `build/Notification.app` 中的构建一致，再次运行 `codesign --verify --strict` 通过。
 - 原创菜单栏与应用图标已渲染检查。实际 SwiftUI 浮层组件使用合成内容离屏渲染，见 [组件预览](../assets/preview.png)；这不是桌面上的实时截图。
 - 合成 `PermissionRequest` 输入运行 `--codex-hook`：退出码为 0、无标准输出或错误输出，收件文件被运行中的 GUI 消费。未据此宣称真实审批或实际浮层视觉验收通过。
-- hooks 已合并写入当前用户的 `hooks.json` 并回读一致，信任状态留给用户处理。
+- 当前用户 `hooks.json` 中七类 Notification hooks 已迁移到 `/Applications/Notification.app` 并回读验证，除应用命令路径外其他设置保持一致。安装器默认路径同步更新；`--dry-run` 与当前配置一致且没有改写文件，两组安装器检查再次通过。信任状态留给用户处理。
 - 只读探测发现当前系统通知数据库存在，但当前宿主进程读取返回 `authorization denied`。
 - 本机 App Server 协议定义包含 `waitingOnApproval`、`waitingOnUserInput` 以及审批、提问请求；未将其当成真实接入成功。
 
