@@ -12,14 +12,15 @@ public struct Notice: Codable, Equatable, Identifiable {
     public var bundleID: String?
     public var sessionID: String?
     public var context: String?
+    public var tmux: TmuxContext?
     public var requiresAction: Bool { kind != .notification }
 
     public init(id: String = UUID().uuidString, source: String, title: String, body: String,
                 kind: Kind = .notification, createdAt: Date = Date(), bundleID: String? = nil,
-                sessionID: String? = nil, context: String? = nil) {
+                sessionID: String? = nil, context: String? = nil, tmux: TmuxContext? = nil) {
         self.id = id; self.source = source; self.title = title; self.body = body
         self.kind = kind; self.createdAt = createdAt; self.bundleID = bundleID
-        self.sessionID = sessionID; self.context = context
+        self.sessionID = sessionID; self.context = context; self.tmux = tmux
     }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CSQLite
 import NotificationCore
 
@@ -96,6 +97,118 @@ final class NotificationCoreTests {
         let attributes = try FileManager.default.attributesOfItem(atPath: directory.path)
         checkEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
     }
+
+    func testProjectLabelsRespectManagedBoundaryAndRepositoryRoots() throws {
+        let home = URL(fileURLWithPath: "/Users/example")
+        checkEqual(ProjectContext.label(for: "/Users/example/codex-path/tool/notification", home: home), "tool/notification")
+        checkEqual(ProjectContext.label(for: "/Users/example/codex-path/tool/notification/Sources/Core", home: home), "tool/notification")
+        checkEqual(ProjectContext.label(for: "/Users/example/codex-path-other/tool/notification", home: home), "notification")
+        checkEqual(ProjectContext.label(for: "/Users/example/codex-path/tool", home: home), "tool")
+        checkEqual(ProjectContext.label(for: "/work/My Project", home: home), "My Project")
+        checkNil(ProjectContext.label(for: nil, home: home))
+        checkNil(ProjectContext.label(for: "relative/path", home: home))
+        let repository = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: repository) }
+        try FileManager.default.createDirectory(at: repository.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        checkEqual(ProjectContext.label(for: repository.appendingPathComponent("nested/source").path, home: home), repository.lastPathComponent)
+    }
+
+    func testCompactHookContentAndBackwardCompatibility() throws {
+        let approval = try unwrap(CodexHook.parse(hook("PermissionRequest", input: ["justification": "运行构建检查", "command": "secret"])))
+        checkEqual(approval.notice?.title, "待审批")
+        checkEqual(approval.notice?.body, "运行构建检查")
+        let generic = try unwrap(CodexHook.parse(hook("PermissionRequest", tool: "functions.exec_command")))
+        checkEqual(generic.notice?.body, "exec_command")
+        let question = try unwrap(CodexHook.parse(hook("PreToolUse", tool: "request_user_input_async", input: ["questions": [["title": "选择环境"], ["title": "选择区域"]]])))
+        checkEqual(question.notice?.body, "选择环境\n选择区域")
+        var legacy = try unwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(approval.notice)) as? [String: Any])
+        legacy.removeValue(forKey: "tmux")
+        let decoded = try JSONDecoder().decode(Notice.self, from: JSONSerialization.data(withJSONObject: legacy))
+        checkNil(decoded.tmux)
+        checkEqual(decoded.context, "project")
+    }
+
+    func testCommandTimeoutAndLiteralArguments() {
+        let before = ProcessInfo.processInfo.systemUptime
+        checkNil(LocalCommand.run(URL(fileURLWithPath: "/bin/sleep"), ["2"], timeout: 0.05))
+        checkTrue(ProcessInfo.processInfo.systemUptime - before < 1)
+        checkEqual(LocalCommand.run(URL(fileURLWithPath: "/usr/bin/printf"), ["%s", "literal; $(printf injected)"]), "literal; $(printf injected)")
+    }
+
+    func testTmuxCaptureNavigationAndStaleTargetsOnIsolatedServer() throws {
+        guard let bridge = TmuxBridge.installed() else { print("SKIP isolated tmux integration: tmux unavailable"); return }
+        let directory = URL(fileURLWithPath: "/tmp/notification tests,'\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let socket = directory.appendingPathComponent("socket").path
+        defer {
+            _ = LocalCommand.run(bridge.executable, ["-S", socket, "kill-server"])
+            try? FileManager.default.removeItem(at: directory)
+        }
+        func run(_ arguments: [String]) throws -> String {
+            try unwrap(LocalCommand.run(bridge.executable, ["-S", socket] + arguments, timeout: 1))
+        }
+        _ = try run(["-f", "/dev/null", "new-session", "-d", "-s", "unit-session", "-n", "work 'quoted'; literal", "/bin/sleep 60"])
+        let identity = try run(["display-message", "-p", "#{pid}\n#{session_id}\n#{pane_id}"]).split(separator: "\n").map(String.init)
+        checkEqual(identity.count, 3)
+        let environment = ["TMUX": "\(socket),\(identity[0]),\(identity[1].dropFirst())", "TMUX_PANE": identity[2]]
+        let original = try unwrap(bridge.capture(environment: environment))
+        checkEqual(original.sessionName, "unit-session")
+        checkEqual(original.windowName, "work 'quoted'; literal")
+        checkEqual(original.label, "unit-session/work 'quoted'; literal/pane-0")
+        checkEqual(original.socketPath, socket)
+        checkEqual(try JSONDecoder().decode(TmuxContext.self, from: JSONEncoder().encode(original)), original)
+        checkNil(bridge.capture(environment: [:]))
+        checkNil(bridge.capture(environment: ["TMUX": environment["TMUX"]!, "TMUX_PANE": "%99999999"]))
+        _ = try run(["rename-window", "-t", original.windowID, "renamed"])
+        let other = try run(["split-window", "-d", "-t", original.paneID, "-P", "-F", "#{pane_id}", "/bin/sleep 60"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try run(["select-pane", "-t", other])
+        _ = try run(["new-window", "-t", original.sessionID, "-n", "other-window", "/bin/sleep 60"])
+        let selected = try bridge.select(original)
+        checkEqual(selected.windowName, "renamed")
+        checkEqual(try run(["display-message", "-p", "-t", original.sessionID, "#{pane_id}"]).trimmingCharacters(in: .whitespacesAndNewlines), original.paneID)
+        checkTrue(bridge.attachedClients(for: selected).isEmpty)
+        let command = try unwrap(bridge.attachCommand(for: selected))
+        checkFalse(command.contains(original.windowName))
+        checkEqual(LocalCommand.run(URL(fileURLWithPath: "/bin/sh"), ["-n", "-c", command]), "")
+        // Attach a real client on an isolated pseudo-terminal, then switch only that client.
+        _ = try run(["new-session", "-d", "-s", "other-session", "/bin/sleep 60"])
+        var master: Int32 = -1; var slave: Int32 = -1
+        var terminalSize = winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0)
+        checkEqual(openpty(&master, &slave, nil, nil, &terminalSize), 0)
+        let terminal = FileHandle(fileDescriptor: slave, closeOnDealloc: false)
+        let clientProcess = Process()
+        clientProcess.executableURL = bridge.executable
+        clientProcess.arguments = ["-S", socket, "attach-session", "-t", "other-session"]
+        var clientEnvironment = ProcessInfo.processInfo.environment
+        clientEnvironment.removeValue(forKey: "TMUX"); clientEnvironment.removeValue(forKey: "TMUX_PANE")
+        clientEnvironment["TERM"] = "xterm-256color"
+        clientProcess.environment = clientEnvironment
+        clientProcess.standardInput = terminal; clientProcess.standardOutput = terminal; clientProcess.standardError = terminal
+        try clientProcess.run()
+        defer {
+            if clientProcess.isRunning { _ = Darwin.kill(clientProcess.processIdentifier, SIGKILL) }
+            clientProcess.waitUntilExit()
+            Darwin.close(master); Darwin.close(slave)
+        }
+        var client: TmuxAttachedClient?
+        for _ in 0..<25 {
+            client = bridge.attachedClients(for: selected).first { $0.pid == clientProcess.processIdentifier }
+            if client != nil { break }
+            usleep(20_000)
+        }
+        let attached = try unwrap(client)
+        checkNotEqual(attached.sessionID, selected.sessionID)
+        try bridge.switchClient(attached, to: selected)
+        checkEqual(bridge.attachedClients(for: selected).first { $0.pid == attached.pid }?.sessionID, selected.sessionID)
+        var invalid = original; invalid.paneID = "%0; display-message injected"
+        checkNil(bridge.attachCommand(for: invalid))
+        var stale = original; stale.serverPID += 1
+        checkNil(bridge.refreshed(stale))
+        checkThrows(try bridge.select(stale))
+        _ = try run(["kill-pane", "-t", original.paneID])
+        checkNil(bridge.refreshed(original))
+        checkThrows(try bridge.select(original))
+    }
 }
 
 
@@ -136,7 +249,11 @@ private func unwrap<T>(_ value: T?) throws -> T {
             ("missing database does not create a file", suite.testMissingDatabaseIsNotCreated),
             ("approval lifecycle and payload minimization", suite.testApprovalLifecycleDoesNotStoreCommand),
             ("sync and async input lifecycle", suite.testInputAndAsyncInputLifecycle),
-            ("inbox expiry, permissions, consume once", suite.testInboxDiscardsExpiredEventsAndConsumesOnce)
+            ("inbox expiry, permissions, consume once", suite.testInboxDiscardsExpiredEventsAndConsumesOnce),
+            ("project labels and managed path boundaries", suite.testProjectLabelsRespectManagedBoundaryAndRepositoryRoots),
+            ("compact content and legacy event decoding", suite.testCompactHookContentAndBackwardCompatibility),
+            ("local command timeout and literal arguments", suite.testCommandTimeoutAndLiteralArguments),
+            ("isolated tmux capture, navigation, rename and stale pane", suite.testTmuxCaptureNavigationAndStaleTargetsOnIsolatedServer)
         ]
         for (name, test) in tests {
             let before = failures

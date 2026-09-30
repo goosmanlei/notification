@@ -15,6 +15,7 @@ macOS 菜单栏工具：将系统通知同步镜像到所有连接屏幕的上�
 - 常驻菜单栏，提供暂停、隐藏内容、测试提醒、最近提醒和可选的登录启动。
 - 首次连接通知数据库只建立基线，不把已有历史通知重新弹出；新增通知和内容更新会被检测。
 - Codex hooks 在审批、提问前发送提醒，在相应工具完成或会话继续后清除。通知工具不返回审批决定。
+- Codex 提醒突出项目名，并可显示 `session-name/window-name/pane-N`，提供「打开 tmux」按钮。
 
 菜单栏图形为自行绘制的「提示灯＋双屏」，矢量源代码见 [Artwork.swift](Sources/NotificationApp/Artwork.swift)。
 
@@ -66,7 +67,11 @@ python3 scripts/install-codex-hooks.py
 - `PostToolUse`：清除对应的同步请求。异步提问返回时用户可能尚未回答，因此不会立即清除。
 - `Stop`、`Interrupt`、`SessionEnd`、`UserPromptSubmit`：清除该会话已有的待处理浮层。
 
-浮层里的「复制恢复命令」会复制 `codex resume <session-id>`。处理当前请求应优先回到原来的终端。提醒工具本身不会批准操作、提交答案或执行复制出的命令。
+浮层顶部显示项目目录名。`~/codex-path/<group>/<project>/` 内的工作目录显示 `<group>/<project>`，子目录也归到该项目；其他目录优先显示 Git 仓库根目录名，否则显示当前目录名。普通系统通知没有工作目录信息时只展示应用来源。
+
+Codex 从 tmux pane 启动且继承了 `TMUX`、`TMUX_PANE` 环境变量时，提醒会附带 `session-name/window-name/pane-N`。「打开 tmux」重新核对 pane，切换对应的 session、window 和 pane，并激活已有终端；没有可复用的终端时，通过系统 Terminal 连接。终端有多个窗口或标签时，激活应用后可能仍需手动选中对应窗口。pane 已关闭或 tmux 服务已重启时会显示失败原因。
+
+未取得 tmux 定位信息或跳转失败时，可用「复制恢复命令」复制 `codex resume <session-id>`。审批和回答仍在 Codex 终端完成。卡片仅保留项目、终端位置、简短状态和实际问题或审批说明，移除了「同步通知」「请回到 Codex 终端处理」等固定尾注。
 
 移除本工具安装的 hooks：
 
@@ -96,12 +101,14 @@ python3 scripts/install-codex-hooks.py --remove
 ./scripts/test.sh
 ```
 
-核心检查使用可执行测试程序，因此无需完整 Xcode 或 XCTest。检查覆盖数据库启动基线、增量插入和更新、去重、hook 生命周期、事件过期及安装器的幂等合并。真实消息接收、多显示器、全屏空间与权限流程需要在 Mac 上另行验收，详见 [验证记录](docs/verification.md)。
+核心检查使用可执行测试程序，因此无需完整 Xcode 或 XCTest。检查覆盖数据库增量读取、hook 生命周期、项目归属、旧事件兼容、子进程超时及安装器合并。已安装 tmux 时，还会启动独立测试服务和虚拟终端，验证 pane 定位、改名、客户端切换与过期目标；不会操作用户的现有 tmux 服务。真实消息接收、多显示器、终端前台聚焦与权限流程需要在 Mac 上另行验收，详见 [验证记录](docs/verification.md)。
 
 代码入口：
 
 - [NotificationDatabase.swift](Sources/NotificationCore/NotificationDatabase.swift)：系统通知数据源，只读 SQLite。
 - [HookEvent.swift](Sources/NotificationCore/HookEvent.swift)：Codex 事件解析及本机消息传递。
+- [ProjectContext.swift](Sources/NotificationCore/ProjectContext.swift)、[TmuxContext.swift](Sources/NotificationCore/TmuxContext.swift)：项目名称与 tmux 定位。
+- [TmuxNavigator.swift](Sources/NotificationApp/TmuxNavigator.swift)：终端激活及连接。
 - [OverlayController.swift](Sources/NotificationApp/OverlayController.swift)：多屏浮层与队列。
 - [AppDelegate.swift](Sources/NotificationApp/AppDelegate.swift)：菜单栏、数据源和系统状态。
 

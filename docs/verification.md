@@ -4,25 +4,28 @@
 
 ## 当前环境
 
-2026-09-30 实测：macOS 26.6.2（25G83）、Apple Silicon、Swift 6.4、Codex CLI 0.159.0。只有 Command Line Tools，没有完整 Xcode。构建脚本使用 SwiftPM 的 native 后端；核心测试使用独立可执行程序。
+2026-09-30 实测：macOS 26.6.2（25G83）、Apple Silicon、Swift 6.4、Codex CLI 0.159.0、tmux 3.7c。只有 Command Line Tools，没有完整 Xcode。构建脚本使用 SwiftPM 的 native 后端；核心测试使用独立可执行程序。
 
 ## 已完成
 
-- 六组核心检查通过：二进制 plist 解析与去重、数据库初次基线与新增/更新、缺失数据库不被创建、审批生命周期与命令不落盘、同步/异步提问生命周期、私有收件目录与事件过期。
+- 十组核心检查通过：原有六组数据库与事件检查，以及项目目录边界、精简文案与旧事件解码、子进程超时与参数原样传递、隔离 tmux 集成检查。
+- 隔离 tmux 服务配合虚拟终端实测：包含空格、逗号和引号的 socket 路径可用；窗口改名后仍能定位原 pane；可切换指定客户端和 window/pane；旧服务标识与关闭的 pane 会被拒绝。测试结束后清理本次独立服务。
 - 两组 hooks 安装器检查通过：保留其他 hooks、重复安装幂等、只移除本安装的条目。
 - 发布构建、Info.plist 校验及本地临时签名校验通过。新尺寸版本已更新至 `/Applications/Notification.app` 并确认进程重新运行，可执行文件 SHA-256 与 `build/Notification.app` 中的构建一致，`codesign --verify --strict` 通过。
-- 浮层默认宽度保留 880 点，卡片高度按用户最新要求恢复为 156 点，保留较窄屏幕的宽度限制。本次高度调整通过发布构建及组件预览检查，预览为 912 × 375 像素；未改动的核心与 hooks 检查结果沿用此前验证。
+- 浮层默认宽 880 点、卡片高 156 点，保留较窄屏幕的宽度限制。项目与 tmux 信息、跳转按钮和精简文案已通过发布构建及组件预览检查，预览为 912 × 375 像素。
 - 原创菜单栏与应用图标已渲染检查。实际 SwiftUI 浮层组件使用合成内容离屏渲染，见 [组件预览](../assets/preview.png)；这不是桌面上的实时截图。
 - 合成 `PermissionRequest` 输入运行 `--codex-hook`：退出码为 0、无标准输出或错误输出，收件文件被运行中的 GUI 消费。未据此宣称真实审批或实际浮层视觉验收通过。
+- 本次使用安装后的程序发送合成 `PreToolUse` 提问，读回项目名及当前真实 tmux 的 socket/pane 字段，单次 hook 运行约 124 毫秒；没有标准输出或错误输出。随后在内置屏实际浮层中核对项目、tmux 标签及按钮，点击「打开 tmux」后核对目标会话的活动 pane 正确。合成 show/clear 事件均被 GUI 消费，测试提醒已清除。
 - 当前用户 `hooks.json` 中七类 Notification hooks 已迁移到 `/Applications/Notification.app` 并回读验证，除应用命令路径外其他设置保持一致。安装器默认路径同步更新；`--dry-run` 与当前配置一致且没有改写文件。用户随后在本会话确认已信任全部七个 hooks，未据此宣称真实事件验证通过。
 - 只读探测发现当前系统通知数据库存在，但当前宿主进程读取返回 `authorization denied`。
 - 本机 App Server 协议定义包含 `waitingOnApproval`、`waitingOnUserInput` 以及审批、提问请求；未将其当成真实接入成功。
 
 ## 待验收
 
-- 菜单栏交互及多屏实际显示。Computer Use 此前绑定已安装应用返回 `cgWindowNotFound`，本次更新后返回 `timeoutReached`；已确认应用进程运行，仍无法通过自动化检查实际界面，不用离屏渲染替代实际界面验收。
+- 完整菜单栏交互与多屏实际显示。此前没有可绑定窗口时 Computer Use 返回 `cgWindowNotFound` 或 `timeoutReached`；本次在持续测试浮层存在时成功绑定并截图，已验证内置屏浮层，未据此宣称其他屏幕和所有窗口状态均通过。
 - 为最终应用开启完全磁盘访问后，来自多个常用应用的真实新通知。
 - Codex CLI 真实审批和提问事件（用户已确认信任 hooks）。
+- 原生终端的多个窗口/标签聚焦，以及无客户端时的 Terminal 连接。隔离测试已验证跨 session 的客户端切换，本次桌面按钮检查验证了当前已连接会话的目标 pane。
 - 双屏/三屏、插拔屏幕、全屏空间、锁屏、休眠恢复和长时间运行。
 
 ## 复现组件渲染

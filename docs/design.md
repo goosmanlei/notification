@@ -24,6 +24,16 @@ Codex 的官方 hooks 提供 `PermissionRequest`，并允许通过 `PreToolUse`�
 
 同步工具完成时，以会话、轮次、工具名和参数指纹匹配并清除提醒。异步提问调用返回不代表用户已回答，因此保持提醒，直到用户继续会话或手动关闭。该行为必须结合实际 CLI 版本验证。
 
+### 项目和 tmux 定位
+
+项目名来自事件中的工作目录。路径位于用户主目录的 `codex-path/<group>/<project>` 下时，保留前两级；普通目录取最近 Git 根目录名，找不到时取当前目录名。系统通知不提供工作目录时不附加项目名。
+
+只有产生提醒的 hook 才查询 tmux。它从自身环境的 `TMUX` 与 `TMUX_PANE` 取得 socket、服务进程和 pane 标识，通过 `list-panes -a -F` 获取 session/window 名称与 pane 序号。tmux 的格式字段适用于查询运行中的服务信息。[tmux 官方格式说明](https://github.com/tmux/tmux/wiki/Formats)
+
+每次本地查询限制为 0.5 秒和 256 KiB 输出；失败时继续发送项目提醒。事件只附加定位必需的字段，不记录终端历史或 pane 内容。窗口名称只作展示，跳转以服务进程和稳定标识重新校验目标，再通过独立参数调用 tmux。
+
+用户点击按钮后，优先选择目标 session 的已连接客户端，否则选择最近活动的客户端；沿进程父子关系找到终端应用并激活。找不到可复用终端时，生成权限为 0700 的临时 `.command` 文件，由系统 Terminal 连接，命令结束后自行移除。socket 和程序路径经过 shell 引号转义，session/window/pane 使用验证过的标识。多个终端窗口的精确前台聚焦仍需现场验收。
+
 App Server 也定义了等待审批、等待用户输入的状态及请求事件。本机 0.159.0 导出的协议包含这些类型，但本轮共享后台旁路连接探测没有收到初始化回应，故未把它接成首版数据源。[OpenAI App Server 文档](https://learn.chatgpt.com/docs/app-server)
 
 ## 展示与数据生命周期

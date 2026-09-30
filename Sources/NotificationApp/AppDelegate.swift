@@ -174,7 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         receive(Notice(source: "Notification", title: "每一块屏幕，都能看见", body: "通知会同步显示在所有屏幕上方，不打断当前输入。"))
     }
     @objc private func demoHITL() {
-        receive(Notice(source: "Codex CLI · 演示", title: "需要你的审批", body: "这是一条测试提醒。实际任务请回到原终端处理。", kind: .approval))
+        receive(Notice(source: "Codex CLI · 演示", title: "待审批", body: "这是菜单栏生成的测试提醒。", kind: .approval))
     }
     @objc private func toggleLogin() {
         do {
