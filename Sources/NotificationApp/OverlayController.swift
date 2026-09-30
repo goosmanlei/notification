@@ -8,16 +8,25 @@ final class FloatingPanel: NSPanel {
 }
 
 final class OverlayController {
+    private static let preferredWidth: CGFloat = 880
+    private static let cardHeight: CGFloat = 234
+    private static let cardSpacing: CGFloat = 15
+    private static let horizontalInset: CGFloat = 8
+    private static let queueHeight: CGFloat = 39
+
     /// Render the actual card view with synthetic content for layout review; this is not a live-screen capture.
     static func renderPreview(to url: URL) throws {
         let notices = [
             Notice(source: "Notification", title: "每一块屏幕，都能看见", body: "新通知同步显示在各屏幕上方，继续专注于手头的工作。"),
             Notice(source: "Codex CLI", title: "需要你的回答", body: "这次构建要使用哪一个目标环境？请回到终端选择。", kind: .input, context: "notification")
         ]
-        let view = NSHostingView(rootView: VStack(spacing: 12) {
-            ForEach(notices) { notice in NoticeCard(notice: notice, hideBody: false, dismiss: {}).frame(height: 156) }
-        }.padding(16).frame(width: 472, height: 356).background(Color(red: 0.89, green: 0.92, blue: 0.94)))
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 472, height: 356), styleMask: .borderless, backing: .buffered, defer: false)
+        let padding: CGFloat = 24
+        let width = preferredWidth - horizontalInset * 2 + padding * 2
+        let height = CGFloat(notices.count) * cardHeight + CGFloat(notices.count - 1) * cardSpacing + padding * 2
+        let view = NSHostingView(rootView: VStack(spacing: cardSpacing) {
+            ForEach(notices) { notice in NoticeCard(notice: notice, hideBody: false, dismiss: {}).frame(height: cardHeight) }
+        }.padding(padding).frame(width: width, height: height).background(Color(red: 0.89, green: 0.92, blue: 0.94)))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: .borderless, backing: .buffered, defer: false)
         window.contentView = view
         view.layoutSubtreeIfNeeded()
         guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
@@ -97,8 +106,8 @@ final class OverlayController {
         panels.forEach { $0.orderOut(nil) }; panels = []
         guard !paused, !locked, !active.isEmpty else { return }
         for screen in NSScreen.screens {
-            let width = min(CGFloat(440), max(240, screen.visibleFrame.width - 48))
-            let height = CGFloat(active.count) * 166 + (waiting.isEmpty ? 0 : 26)
+            let width = min(Self.preferredWidth, max(240, screen.visibleFrame.width - 48))
+            let height = CGFloat(active.count) * (Self.cardHeight + Self.cardSpacing) + (waiting.isEmpty ? 0 : Self.queueHeight)
             let panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
                                       styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
@@ -110,17 +119,17 @@ final class OverlayController {
             let hidden = hideBody
             let count = waiting.count
             let dismiss: (String) -> Void = { [weak self] id in self?.resolve(id: id) }
-            panel.contentView = NSHostingView(rootView: VStack(spacing: 10) {
+            panel.contentView = NSHostingView(rootView: VStack(spacing: Self.cardSpacing) {
                 ForEach(visible) { notice in
                     NoticeCard(notice: notice, hideBody: hidden, dismiss: { dismiss(notice.id) })
-                        .frame(height: 156)
+                        .frame(height: Self.cardHeight)
                 }
                 if count > 0 {
                     Text("还有 \(count) 条提醒等待显示").font(.system(size: 12, weight: .medium))
                         .padding(.horizontal, 12).padding(.vertical, 3)
                         .background(.regularMaterial, in: Capsule())
                 }
-            }.padding(.horizontal, 4))
+            }.padding(.horizontal, Self.horizontalInset))
             let frame = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: frame.midX - width / 2,
                                          y: max(frame.minY + 12, frame.maxY - 40 - height)))

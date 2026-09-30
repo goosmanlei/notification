@@ -10,18 +10,19 @@
 
 - 六组核心检查通过：二进制 plist 解析与去重、数据库初次基线与新增/更新、缺失数据库不被创建、审批生命周期与命令不落盘、同步/异步提问生命周期、私有收件目录与事件过期。
 - 两组 hooks 安装器检查通过：保留其他 hooks、重复安装幂等、只移除本安装的条目。
-- 发布构建、Info.plist 校验及本地临时签名校验通过。用户将应用移至 `/Applications/Notification.app` 后，核对可执行文件 SHA-256 与 `build/Notification.app` 中的构建一致，再次运行 `codesign --verify --strict` 通过。
+- 发布构建、Info.plist 校验及本地临时签名校验通过。新尺寸版本已更新至 `/Applications/Notification.app` 并确认进程重新运行，可执行文件 SHA-256 与 `build/Notification.app` 中的构建一致，`codesign --verify --strict` 通过。
+- 浮层默认宽度由 440 点改为 880 点，卡片高度由 156 点改为 234 点；横向内边距及纵向间距同步按各自比例调整，保留较窄屏幕的宽度限制。新组件预览为 912 × 531 像素；构建、六组核心检查和两组安装器检查通过。
 - 原创菜单栏与应用图标已渲染检查。实际 SwiftUI 浮层组件使用合成内容离屏渲染，见 [组件预览](../assets/preview.png)；这不是桌面上的实时截图。
 - 合成 `PermissionRequest` 输入运行 `--codex-hook`：退出码为 0、无标准输出或错误输出，收件文件被运行中的 GUI 消费。未据此宣称真实审批或实际浮层视觉验收通过。
-- 当前用户 `hooks.json` 中七类 Notification hooks 已迁移到 `/Applications/Notification.app` 并回读验证，除应用命令路径外其他设置保持一致。安装器默认路径同步更新；`--dry-run` 与当前配置一致且没有改写文件，两组安装器检查再次通过。信任状态留给用户处理。
+- 当前用户 `hooks.json` 中七类 Notification hooks 已迁移到 `/Applications/Notification.app` 并回读验证，除应用命令路径外其他设置保持一致。安装器默认路径同步更新；`--dry-run` 与当前配置一致且没有改写文件。用户随后在本会话确认已信任全部七个 hooks，未据此宣称真实事件验证通过。
 - 只读探测发现当前系统通知数据库存在，但当前宿主进程读取返回 `authorization denied`。
 - 本机 App Server 协议定义包含 `waitingOnApproval`、`waitingOnUserInput` 以及审批、提问请求；未将其当成真实接入成功。
 
 ## 待验收
 
-- 菜单栏交互及多屏实际显示。Computer Use 绑定已安装应用返回 `cgWindowNotFound`；该自动化窗口定位问题尚未解决，不用离屏渲染替代实际界面验收。
+- 菜单栏交互及多屏实际显示。Computer Use 此前绑定已安装应用返回 `cgWindowNotFound`，本次更新后返回 `timeoutReached`；已确认应用进程运行，仍无法通过自动化检查实际界面，不用离屏渲染替代实际界面验收。
 - 为最终应用开启完全磁盘访问后，来自多个常用应用的真实新通知。
-- 在用户信任 hooks 后，Codex CLI 真实审批和提问事件。
+- Codex CLI 真实审批和提问事件（用户已确认信任 hooks）。
 - 双屏/三屏、插拔屏幕、全屏空间、锁屏、休眠恢复和长时间运行。
 
 ## 复现组件渲染
