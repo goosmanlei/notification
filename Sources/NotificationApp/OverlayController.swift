@@ -8,7 +8,7 @@ final class FloatingPanel: NSPanel {
 }
 
 final class OverlayController {
-    private static let preferredWidth: CGFloat = 880
+    private static let preferredWidth: CGFloat = 1320
     private static let cardHeight: CGFloat = 156
     private static let cardSpacing: CGFloat = 15
     private static let horizontalInset: CGFloat = 8
