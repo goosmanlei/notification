@@ -17,8 +17,10 @@ final class OverlayController {
     /// Render the actual card view with synthetic content for layout review; this is not a live-screen capture.
     static func renderPreview(to url: URL) throws {
         let notices = [
-            Notice(source: "Notification", title: "每一块屏幕，都能看见", body: "新通知同步显示在各屏幕上方，继续专注于手头的工作。"),
-            Notice(source: "Codex CLI", title: "需要你的回答", body: "这次构建要使用哪一个目标环境？请回到终端选择。", kind: .input, context: "notification")
+            Notice(source: "Notification", title: "构建已完成", body: "新的应用版本已就绪。"),
+            Notice(source: "Codex CLI", title: "待回答", body: "这次构建要使用哪一个目标环境？", kind: .input,
+                   context: "tool/notification", tmux: TmuxContext(socketPath: "/tmp/notification-preview", serverPID: 1,
+                   sessionID: "$1", windowID: "@1", paneID: "%1", sessionName: "dev", windowName: "notification", paneIndex: 2))
         ]
         let padding: CGFloat = 24
         let width = preferredWidth - horizontalInset * 2 + padding * 2
@@ -139,40 +141,70 @@ final class OverlayController {
     }
 }
 
+// Keep the property wrapper available with Command Line Tools SDKs that omit SwiftUIMacros.
+private typealias ViewState<Value> = SwiftUI.State<Value>
+
 private struct NoticeCard: View {
     let notice: Notice
     let hideBody: Bool
     let dismiss: () -> Void
+    @ViewState private var isOpeningTmux = false
+    @ViewState private var navigationError: String?
     private var accent: Color { notice.requiresAction ? Color(red: 0.98, green: 0.70, blue: 0.26) : Color(red: 0.36, green: 0.86, blue: 0.78) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: notice.requiresAction ? "hand.raised.fill" : "bell.badge.fill").foregroundStyle(accent)
-                Text(notice.source).lineLimit(1).font(.system(size: 12, weight: .semibold))
-                if let context = notice.context { Text("· \(context)").lineLimit(1).foregroundStyle(.white.opacity(0.6)).font(.system(size: 11)) }
+                Text(!hideBody ? notice.context ?? notice.source : notice.source)
+                    .lineLimit(1).truncationMode(.middle).font(.system(size: notice.context == nil || hideBody ? 12 : 17, weight: .semibold))
+                if notice.context != nil && !hideBody {
+                    Text(notice.source).lineLimit(1).foregroundStyle(.white.opacity(0.55)).font(.system(size: 11))
+                }
                 Spacer(minLength: 4)
+                if notice.requiresAction {
+                    Text(notice.title).font(.system(size: 12, weight: .medium)).foregroundStyle(accent)
+                }
                 Button(action: dismiss) { Image(systemName: "xmark").font(.system(size: 11, weight: .semibold)).padding(4) }
                     .buttonStyle(.plain).help("在所有屏幕关闭此提醒")
                     .accessibilityLabel("关闭提醒")
             }
-            Text(hideBody ? "收到一条新提醒" : notice.title).font(.system(size: 19, weight: .bold)).lineLimit(1)
-            Text(hideBody ? "内容已隐藏" : notice.body).font(.system(size: 13)).foregroundStyle(.white.opacity(0.85))
-                .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
-            HStack {
-                Text(notice.requiresAction ? "请回到 Codex 终端处理" : "同步通知")
-                    .font(.system(size: 10, weight: .medium)).foregroundStyle(.white.opacity(0.5))
-                Spacer()
-                if let session = notice.sessionID, UUID(uuidString: session) != nil {
-                    Button("复制恢复命令") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString("codex resume \(session)", forType: .string)
-                    }.buttonStyle(.plain).foregroundStyle(accent).font(.system(size: 11, weight: .semibold))
-                } else if let bundle = notice.bundleID, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
-                    Button("打开应用") { NSWorkspace.shared.openApplication(at: url, configuration: .init()) { _, _ in }; dismiss() }
-                        .buttonStyle(.plain).foregroundStyle(accent).font(.system(size: 11, weight: .semibold))
+            if let tmux = notice.tmux, !hideBody {
+                Label(tmux.label, systemImage: "terminal")
+                    .font(.system(size: 12, design: .monospaced)).foregroundStyle(.white.opacity(0.65))
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            if !notice.requiresAction {
+                Text(hideBody ? "收到一条新提醒" : notice.title).font(.system(size: 19, weight: .bold)).lineLimit(1)
+            }
+            if hideBody || !notice.body.isEmpty {
+                Text(hideBody ? "内容已隐藏" : notice.body).font(.system(size: notice.requiresAction ? 15 : 13))
+                    .foregroundStyle(.white.opacity(0.85)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Spacer(minLength: 0)
+            HStack(spacing: 14) {
+                if let error = navigationError {
+                    Text(error).font(.system(size: 11)).foregroundStyle(accent).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                if let tmux = notice.tmux {
+                    Button(isOpeningTmux ? "定位中…" : "打开 tmux") {
+                        isOpeningTmux = true; navigationError = nil
+                        TmuxNavigator.open(tmux) { error in isOpeningTmux = false; navigationError = error }
+                    }.disabled(isOpeningTmux)
+                }
+                if notice.tmux == nil || navigationError != nil {
+                    if let session = notice.sessionID, UUID(uuidString: session) != nil {
+                        Button("复制恢复命令") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString("codex resume \(session)", forType: .string)
+                        }
+                    } else if let bundle = notice.bundleID, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
+                        Button("打开应用") { NSWorkspace.shared.openApplication(at: url, configuration: .init()) { _, _ in }; dismiss() }
+                    }
                 }
             }
+            .buttonStyle(.plain).foregroundStyle(accent).font(.system(size: 12, weight: .semibold))
         }
         .padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .foregroundStyle(.white)

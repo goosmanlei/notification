@@ -34,12 +34,12 @@ public enum CodexHook {
         } ?? false
         guard event == "PermissionRequest" || (event == "PreToolUse" && isInput) else { return nil }
         let kind: Notice.Kind = event == "PermissionRequest" ? .approval : .input
-        let context = (root["cwd"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent }
+        let context = ProjectContext.label(for: root["cwd"] as? String)
         let questions = input["questions"] as? [[String: Any]] ?? []
         // Never persist commands, raw tool arguments, tokens, or full transcripts.
-        let body = kind == .approval ? "\(tool.isEmpty ? "操作" : tool) 需要你在 Codex 终端中确认。"
-            : (questions.first?["question"] as? String ?? questions.first?["title"] as? String ?? "Codex 正在请求你的回答，请回到终端处理。")
-        let notice = Notice(id: key, source: "Codex CLI", title: kind == .approval ? "需要你的审批" : "需要你的回答",
+        let body = kind == .approval ? (input["justification"] as? String ?? tool.split(separator: ".").last.map(String.init) ?? "")
+            : questions.compactMap { $0["question"] as? String ?? $0["title"] as? String }.joined(separator: "\n")
+        let notice = Notice(id: key, source: "Codex CLI", title: kind == .approval ? "待审批" : "待回答",
                             body: String(body.prefix(1000)), kind: kind, createdAt: now,
                             sessionID: session, context: context)
         return HookEvent(action: .show, key: key, sessionID: session, createdAt: now, notice: notice)
