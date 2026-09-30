@@ -39,21 +39,27 @@ open /Applications/Notification.app
 
 首次安装及后续更新统一使用 `/Applications/Notification.app`。更新前先从菜单栏退出应用，再执行上述命令。
 
-本地构建使用临时签名，未作 Developer ID 签名或公证。重新构建并替换应用后，系统可能要求重新授予权限。若辅助功能开关已开而应用仍提示未授权，移除列表中的 Notification，再添加 `/Applications/Notification.app`；完全磁盘访问则需重新开启并退出重开应用。以应用实际测试结果为准。
+本地构建使用临时签名，未作 Developer ID 签名或公证。重新构建并替换应用后，系统可能要求重新授予权限。完全磁盘访问需重新开启并退出重开应用，以实际读取结果为准。当前消息打开方式不再需要辅助功能权限。
 
 ### 接收系统通知
 
 1. 点击菜单栏 Notification 图标，选择「设置与接入说明」。
 2. 在系统设置的「隐私与安全性 → 完全磁盘访问」中添加并开启 `Notification.app`。
 3. 退出并重新打开 Notification，确认菜单显示「系统通知：监听中（实验性）」。
-4. 点击「发送系统通知测试」，首次使用时允许本应用发送通知。设置中出现「已从通知中心读回并展示」才表示这条测试消息通过了 macOS 投递、数据库读取和浮层展示链路。「显示测试通知」仍只检验浮层。
+4. 点击「发送系统通知测试」，首次使用时允许本应用发送通知。设置中出现「已从通知中心读回，耗时 … 毫秒」才表示这条测试消息通过了 macOS 投递和数据库读取，浮层显示需同时目视核对。耗时从点击后提交测试通知算到 GUI 收到数据库结果，包含系统投递时间。「显示测试通知」仍只检验浮层。
 5. 用常用应用各产生一条**新的**真实通知，检查系统和所有屏幕上的浮层是否都出现；单条测试成功不能证明所有应用的覆盖率。
 
-保留原应用的通知权限和通知中心设置。关闭原应用通知后，本工具无法替它接收消息。隐藏预览的通知只能显示系统实际提供的内容。
+保留原应用的通知权限。关闭横幅或通知中心列表后，只要系统仍把通知写入可读取的数据库，Notification 就有机会接收；若关闭全部通知或消息没有落库，本工具无法补收。隐藏预览的通知只能显示系统实际提供的内容。
 
-「打开原通知」是实验性消息定位入口，需要为 Notification 开启「隐私与安全性 → 辅助功能」。它尝试找到并点击通知中心里的原始卡片，由原应用处理通知点击；不拼接或猜测消息链接。若匹配到可识别的折叠通知组，会先展开再定位具体消息。原卡片已清除、文字无法匹配、藏在无法识别的组内或存在多条相同通知时，可能无法定位；失败后可选择「打开应用」，此退路只激活应用。辅助功能界面结构随系统版本变化，支持范围以实际验证为准。
+### 打开通知来源
 
-可在设置中先「发送系统通知测试」，等待读回后再「打开最近测试的原通知」。出现「已收到此条原通知的默认点击」，才表示本应用收到该消息的真实点击回调；这不代表已验收其他应用的内部页面定位。
+普通通知（包括飞书）统一提供「打开应用」，激活对应应用；不定位具体消息、不查询聊天记录，也不需要辅助功能权限。只有 Codex 人工介入提醒保留项目、tmux 定位和恢复命令等专用操作。
+
+### 接收速度
+
+程序监听通知数据库及其写入日志的文件变化，收到变化后立即安排读取；连续写入合并约 10 毫秒，并用 250 毫秒定时检查兜底。数据库版本未变化时不重复解析正文。已移除正常读取后的额外一秒等待，权限或读取失败才延后重试。
+
+这一优化减少的是 Notification 自身的检测等待。飞书向 macOS 提交通知、系统写入数据库，以及浮层槽位已满时的排队仍可能增加总延迟。设置中的系统测试可以测量本机投递到读回的耗时；实际飞书消息的延迟需另外核对。
 
 ### 接收 Codex CLI 人工介入提醒
 
@@ -88,7 +94,7 @@ python3 scripts/install-codex-hooks.py --remove
 
 | 情况 | 当前行为 |
 | --- | --- |
-| 通知进入可读取的系统数据库 | 每秒检查数据库变化，解析后同步展示 |
+| 通知进入可读取的系统数据库 | 文件变化唤醒读取，250 毫秒兜底检查，解析后进入浮层 |
 | 通知没有落库，或两次检查之间已被删除 | 可能无法捕获；不等同于实时拦截系统通知流 |
 | 启动前已有通知 | 建立基线，不重放 |
 | 通知内容被原应用或系统隐藏 | 不尝试恢复隐藏内容 |
@@ -106,7 +112,7 @@ python3 scripts/install-codex-hooks.py --remove
 ./scripts/test.sh
 ```
 
-核心检查使用可执行测试程序，因此无需完整 Xcode 或 XCTest。检查覆盖数据库增量读取、hook 生命周期、项目归属、旧事件兼容、子进程超时及安装器合并。已安装 tmux 时，还会启动独立测试服务和虚拟终端，验证 pane 定位、改名、客户端切换与过期目标；不会操作用户的现有 tmux 服务。真实消息接收、多显示器、终端前台聚焦与权限流程需要在 Mac 上另行验收，详见 [验证记录](docs/verification.md)。
+核心检查使用可执行测试程序，因此无需完整 Xcode 或 XCTest。检查覆盖数据库增量读取、hook 生命周期、项目归属、旧事件兼容、子进程超时、文件变化唤醒、日志写入读取、文件替换、兜底定时器及安装器合并。已安装 tmux 时，还会启动独立测试服务和虚拟终端，验证 pane 定位、改名、客户端切换与过期目标；不会操作用户的现有 tmux 服务。真实消息接收、多显示器、终端前台聚焦与权限流程需要在 Mac 上另行验收，详见 [验证记录](docs/verification.md)。
 
 代码入口：
 
@@ -114,7 +120,7 @@ python3 scripts/install-codex-hooks.py --remove
 - [HookEvent.swift](Sources/NotificationCore/HookEvent.swift)：Codex 事件解析及本机消息传递。
 - [ProjectContext.swift](Sources/NotificationCore/ProjectContext.swift)、[TmuxContext.swift](Sources/NotificationCore/TmuxContext.swift)：项目名称与 tmux 定位。
 - [TmuxNavigator.swift](Sources/NotificationApp/TmuxNavigator.swift)：终端激活及连接。
-- [SystemNotificationOpener.swift](Sources/NotificationApp/SystemNotificationOpener.swift)：辅助功能原通知点击与安全退路。
+- [SourceMonitor.swift](Sources/NotificationCore/SourceMonitor.swift)：数据库与 Codex 收件目录的事件唤醒和定时兜底。
 - [OverlayController.swift](Sources/NotificationApp/OverlayController.swift)：多屏浮层与队列。
 - [AppDelegate.swift](Sources/NotificationApp/AppDelegate.swift)：菜单栏、数据源和系统状态。
 

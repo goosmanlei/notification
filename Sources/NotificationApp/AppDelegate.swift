@@ -6,12 +6,13 @@ import NotificationCore
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private let overlays = OverlayController()
-    private let worker = DispatchQueue(label: "notification.sources", qos: .utility)
-    private var timer: DispatchSourceTimer?
+    private let worker = DispatchQueue(label: "notification.sources", qos: .userInitiated)
+    private var sourceMonitor: SourceMonitor?
     private var database: NotificationDatabase?
     private var databaseStatus = "系统通知：正在连接"
     private var hookStatus = "Codex：等待 hook 事件"
     private var systemTestID: String?
+    private var systemTestStartedAt: TimeInterval?
     private var systemTestStatus: String?
     private var setupWindow: NSWindow?
     private var healthLabel: NSTextField?
@@ -44,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return true
     }
 
-    func applicationWillTerminate(_ notification: Notification) { timer?.cancel() }
+    func applicationWillTerminate(_ notification: Notification) { sourceMonitor?.stop() }
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         add(menu, "Notification  ·  实验版本", enabled: false)
@@ -87,27 +88,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let paths = fixture.map { [URL(fileURLWithPath: $0)] } ?? NotificationDatabase.candidates()
         let path = paths.first { FileManager.default.fileExists(atPath: $0.path) } ?? paths[0]
         database = NotificationDatabase(path: path)
-        var nextAttempt = Date.distantPast
+        var nextAttempt: TimeInterval = 0
         var retryDelay: TimeInterval = 1
         var latestStatus = "系统通知：正在连接"
-        timer = DispatchSource.makeTimerSource(queue: worker)
-        timer?.schedule(deadline: .now(), repeating: 1)
-        timer?.setEventHandler { [weak self] in
+        let watched = [path, URL(fileURLWithPath: path.path + "-wal"), path.deletingLastPathComponent(),
+                       EventInbox.directory, EventInbox.directory.deletingLastPathComponent()]
+        sourceMonitor = SourceMonitor(paths: watched, queue: worker) { [weak self] _ in
             guard let self else { return }
             let events = EventInbox.drain()
             var incoming: [Notice] = []
-            if Date() >= nextAttempt {
+            if ProcessInfo.processInfo.systemUptime >= nextAttempt {
                 do {
                     incoming = try self.database?.poll() ?? []
                     latestStatus = "系统通知：监听中（实验性）"; retryDelay = 1
+                    // The timer/event source controls healthy cadence. Only failures back off.
+                    nextAttempt = 0
                 } catch {
                     let reason = error.localizedDescription.lowercased()
                     if reason.contains("authoriz") || reason.contains("permission") || reason.contains("not permitted") || reason.contains("unable to open") {
                         latestStatus = "系统通知：需要完全磁盘访问"
                     } else { latestStatus = "系统通知：读取失败，请检查版本或权限" }
                     retryDelay = min(30, retryDelay * 2)
+                    nextAttempt = ProcessInfo.processInfo.systemUptime + retryDelay
                 }
-                nextAttempt = Date().addingTimeInterval(retryDelay)
             }
             let status = latestStatus
             DispatchQueue.main.async {
@@ -121,14 +124,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 self.updateBadge()
             }
         }
-        timer?.resume()
+        sourceMonitor?.start()
     }
 
     private func receive(_ raw: Notice) {
         var notice = raw
         if notice.bundleID == Bundle.main.bundleIdentifier, let testID = systemTestID,
            notice.notificationIdentifier == testID {
-            systemTestStatus = "系统测试：已从通知中心读回并展示"
+            let elapsed = systemTestStartedAt.map { Int((ProcessInfo.processInfo.systemUptime - $0) * 1000) }
+            systemTestStatus = "系统测试：已从通知中心读回" + (elapsed.map { "，耗时 \($0) 毫秒" } ?? "")
         }
         if let bundle = notice.bundleID, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
             notice.source = FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
@@ -203,6 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 }
                 let identifier = "notification-test-" + UUID().uuidString
                 self.systemTestID = identifier
+                self.systemTestStartedAt = ProcessInfo.processInfo.systemUptime
                 self.systemTestStatus = "系统测试：已发送，等待从通知中心读回"
                 self.updateBadge()
                 let content = UNMutableNotificationContent()
@@ -222,29 +227,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         completionHandler([.banner, .list])
     }
 
-    @objc private func testOriginalNotification() {
-        guard let identifier = systemTestID,
-              let notice = recent.first(where: { $0.notificationIdentifier == identifier && $0.bundleID == Bundle.main.bundleIdentifier }) else {
-            systemTestStatus = "原通知测试：请先发送系统通知，等待读回后再点击"; updateBadge(); return
-        }
-        systemTestStatus = "原通知测试：正在定位，等待原应用确认点击"; updateBadge()
-        SystemNotificationOpener.open(notice) { [weak self] error in
-            guard let self, let error else { return }
-            self.systemTestStatus = "原通知测试：\(error)"; self.updateBadge()
-        }
-    }
-
-    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
-                                withCompletionHandler completionHandler: @escaping () -> Void) {
-        if response.notification.request.identifier == systemTestID,
-           response.actionIdentifier == UNNotificationDefaultActionIdentifier {
-            DispatchQueue.main.async {
-                self.systemTestStatus = "系统测试：已收到此条原通知的默认点击"
-                self.showSetup(); self.updateBadge()
-            }
-        }
-        completionHandler()
-    }
     @objc private func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
@@ -256,7 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @objc private func showSetup() {
         if let setupWindow { setupWindow.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 550, height: 590),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 550, height: 510),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Notification · 设置与接入"; window.isReleasedWhenClosed = false
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 16
@@ -266,16 +248,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let health = NSTextField(wrappingLabelWithString: "\(databaseStatus)\n\(hookStatus)")
         health.font = .systemFont(ofSize: 12); health.textColor = .secondaryLabelColor
         stack.addArrangedSubview(health); healthLabel = health
-        let copy = NSTextField(wrappingLabelWithString: "1. 读取系统通知\n在「隐私与安全性 → 完全磁盘访问」添加 Notification.app，开启后退出并重新打开本应用。原有系统通知照常显示。\n\n2. 接收 Codex 人工介入提醒\n按仓库说明安装 hooks，在 Codex CLI 输入 /hooks 检查并信任。提醒不会替你批准操作。\n\n系统通知读取依赖 macOS 内部数据库，只能显示系统实际保存的内容。首次连接不重放历史通知。")
+        let copy = NSTextField(wrappingLabelWithString: "1. 读取系统通知\n在「隐私与安全性 → 完全磁盘访问」添加 Notification.app，开启后退出并重新打开本应用。\n\n2. 接收 Codex 人工介入提醒\n按仓库说明安装 hooks，在 Codex CLI 输入 /hooks 检查并信任。审批和回答仍在 Codex 中完成。\n\n普通通知仅提供「打开应用」。系统通知读取依赖 macOS 内部数据库，只能显示系统实际保存的内容；首次连接不重放历史通知。")
         copy.font = .systemFont(ofSize: 13); copy.preferredMaxLayoutWidth = 490; stack.addArrangedSubview(copy)
         let permissions = NSButton(title: "打开完全磁盘访问设置", target: self, action: #selector(openPermissions))
         stack.addArrangedSubview(permissions)
-        let tests = NSStackView(views: [
-            NSButton(title: "发送系统通知测试", target: self, action: #selector(testSystemNotification)),
-            NSButton(title: "打开最近测试的原通知", target: self, action: #selector(testOriginalNotification))
-        ])
-        tests.spacing = 12; stack.addArrangedSubview(tests)
-        stack.addArrangedSubview(NSButton(title: "打开辅助功能设置（原通知定位）", target: self, action: #selector(openAccessibility)))
+        stack.addArrangedSubview(NSButton(title: "发送系统通知测试", target: self, action: #selector(testSystemNotification)))
         let docs = NSButton(title: "打开接入与验证说明", target: self, action: #selector(openDocs))
         stack.addArrangedSubview(docs)
         let reveal = NSButton(title: "在 Finder 中显示本应用", target: self, action: #selector(revealApp))
@@ -285,9 +262,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
     @objc private func openPermissions() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
-    }
-    @objc private func openAccessibility() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
     @objc private func openDocs() { NSWorkspace.shared.open(URL(string: "https://github.com/goosmanlei/notification#使用")!) }
     @objc private func revealApp() { NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL]) }

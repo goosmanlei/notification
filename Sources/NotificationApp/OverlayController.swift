@@ -85,12 +85,19 @@ final class OverlayController {
     }
 
     func resolve(id: String) {
+        guard active.contains(where: { $0.notice.id == id }) || waiting.contains(where: { $0.id == id }) else { return }
         active.removeAll { $0.notice.id == id }; waiting.removeAll { $0.id == id }
         fill(); render(); onChange?()
     }
 
+    private func setActionInProgress(id: String, _ inProgress: Bool) {
+        guard let index = active.firstIndex(where: { $0.notice.id == id }), !active[index].notice.requiresAction else { return }
+        active[index].deadline = inProgress ? nil : Date().addingTimeInterval(duration)
+    }
+
     func clear(session: String? = nil) {
         if let session {
+            guard active.contains(where: { $0.notice.sessionID == session }) || waiting.contains(where: { $0.sessionID == session }) else { return }
             active.removeAll { $0.notice.sessionID == session }; waiting.removeAll { $0.sessionID == session }
         } else { active = []; waiting = [] }
         fill(); render(); onChange?()
@@ -131,9 +138,11 @@ final class OverlayController {
             let hidden = hideBody
             let count = waiting.count
             let dismiss: (String) -> Void = { [weak self] id in self?.resolve(id: id) }
+            let actionState: (String, Bool) -> Void = { [weak self] id, inProgress in self?.setActionInProgress(id: id, inProgress) }
             panel.contentView = NSHostingView(rootView: VStack(spacing: Self.cardSpacing) {
                 ForEach(Array(visible.enumerated()), id: \.element.id) { index, notice in
-                    NoticeCard(notice: notice, hideBody: hidden, dismiss: { dismiss(notice.id) })
+                    NoticeCard(notice: notice, hideBody: hidden, dismiss: { dismiss(notice.id) },
+                               onActionStateChange: { actionState(notice.id, $0) })
                         .frame(height: heights[index])
                 }
                 if count > 0 {
@@ -158,8 +167,9 @@ private struct NoticeCard: View {
     let notice: Notice
     let hideBody: Bool
     let dismiss: () -> Void
+    var onActionStateChange: (Bool) -> Void = { _ in }
     @ViewState private var isOpeningTmux = false
-    @ViewState private var isOpeningOriginal = false
+    @ViewState private var isOpeningApplication = false
     @ViewState private var navigationError: String?
     private var accent: Color { notice.requiresAction ? Color(red: 0.98, green: 0.70, blue: 0.26) : Color(red: 0.36, green: 0.86, blue: 0.78) }
 
@@ -223,20 +233,17 @@ private struct NoticeCard: View {
                         NSPasteboard.general.setString("codex resume \(session)", forType: .string)
                     } label: { Label("复制恢复命令", systemImage: "doc.on.doc") }
                 } else if let bundle = notice.bundleID, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
-                    if notice.notificationIdentifier != nil {
-                        Button {
-                            isOpeningOriginal = true; navigationError = nil
-                            SystemNotificationOpener.open(notice) { error in
-                                isOpeningOriginal = false; navigationError = error
+                    Button {
+                        isOpeningApplication = true; navigationError = nil; onActionStateChange(true)
+                        NSWorkspace.shared.openApplication(at: url, configuration: .init()) { _, error in
+                            DispatchQueue.main.async {
+                                isOpeningApplication = false; onActionStateChange(false)
+                                navigationError = error.map { "无法打开应用：\($0.localizedDescription)" }
                                 if error == nil { dismiss() }
                             }
-                        } label: { Label(isOpeningOriginal ? "定位中…" : "打开原通知", systemImage: "arrow.up.right.square") }
-                        .disabled(isOpeningOriginal)
-                    }
-                    if notice.notificationIdentifier == nil || navigationError != nil {
-                        Button { NSWorkspace.shared.openApplication(at: url, configuration: .init()) { _, _ in }; dismiss() }
-                        label: { Label("打开应用", systemImage: "app") }
-                    }
+                        }
+                    } label: { Label("打开应用", systemImage: "app") }
+                    .disabled(isOpeningApplication)
                 }
             }
         }
