@@ -29,22 +29,29 @@ final class NotificationCoreTests {
         var writer: OpaquePointer?
         checkEqual(sqlite3_open(path.path, &writer), SQLITE_OK)
         defer { sqlite3_close(writer) }
-        checkEqual(sqlite3_exec(writer, "CREATE TABLE record (rec_id INTEGER PRIMARY KEY, data BLOB)", nil, nil, nil), SQLITE_OK)
+        checkEqual(sqlite3_exec(writer, "CREATE TABLE record (rec_id INTEGER PRIMARY KEY, data BLOB, delivered_date REAL)", nil, nil, nil), SQLITE_OK)
+        let deliveredAt = Date(timeIntervalSinceReferenceDate: 800_000_000)
         func put(_ id: Int64, _ data: Data) {
             var statement: OpaquePointer?
-            checkEqual(sqlite3_prepare_v2(writer, "INSERT OR REPLACE INTO record VALUES (?, ?)", -1, &statement, nil), SQLITE_OK)
+            checkEqual(sqlite3_prepare_v2(writer, "INSERT OR REPLACE INTO record VALUES (?, ?, ?)", -1, &statement, nil), SQLITE_OK)
             defer { sqlite3_finalize(statement) }
             sqlite3_bind_int64(statement, 1, id)
             _ = data.withUnsafeBytes { bytes in
                 sqlite3_bind_blob(statement, 2, bytes.baseAddress, Int32(data.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             }
+            sqlite3_bind_double(statement, 3, deliveredAt.timeIntervalSinceReferenceDate)
             checkEqual(sqlite3_step(statement), SQLITE_DONE)
         }
         put(1, try payload())
         let reader = NotificationDatabase(path: path)
         checkEqual(try reader.poll().count, 0)
+        checkEqual(reader.takeBaseline().map(\.title), ["Test"])
+        checkTrue(reader.takeBaseline().isEmpty)
         put(2, try payload(title: "new"))
-        checkEqual(try reader.poll().map(\.title), ["new"])
+        let inserted = try reader.poll()
+        checkEqual(inserted.map(\.title), ["new"])
+        checkEqual(inserted.first?.createdAt, deliveredAt)
+        checkTrue(reader.takeBaseline().isEmpty)
         checkEqual(try reader.poll().count, 0)
         put(2, try payload(title: "new", response: 2))
         checkEqual(try reader.poll().count, 0)
@@ -56,6 +63,176 @@ final class NotificationCoreTests {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         checkThrows(try NotificationDatabase(path: path).poll())
         checkFalse(FileManager.default.fileExists(atPath: path.path))
+    }
+
+    func testBannerFieldsDoNotMixCardsOrControls() throws {
+        let fields: [BannerContent.Line] = [
+            .init(identifier: "header", text: "Feishu"), .init(identifier: "title", text: "Team"),
+            .init(identifier: "subtitle", text: "Alice"), .init(identifier: "body", text: "Ready"),
+            .init(identifier: "close", text: "Close"), .init(identifier: "", text: "now")
+        ]
+        let banner = try unwrap(BannerContent.parse(fields))
+        checkEqual(banner.source, "Feishu"); checkEqual(banner.title, "Team")
+        checkEqual(banner.body, "Alice\nReady")
+        checkNil(BannerContent.parse(fields + [.init(identifier: "title", text: "Another card")]))
+        checkNil(BannerContent.parse([.init(identifier: "body", text: "Unrelated widget")]))
+        checkNil(BannerContent.parse([.init(identifier: "title", text: "Clock")]))
+        let fallback = try unwrap(BannerContent.parse([.init(identifier: "title", text: "Test"),
+                                                       .init(identifier: "body", text: "hello")],
+                                                      description: "Notification, Test, hello, now"))
+        checkEqual(fallback.source, "Notification")
+        checkTrue(BannerContent.isHistoryControl(role: "AXButton", labels: ["", "Edit Widgets"]))
+        checkTrue(BannerContent.isHistoryControl(role: "AXButton", labels: ["编辑小组件"]))
+        checkFalse(BannerContent.isHistoryControl(role: "AXStaticText", labels: ["Edit Widgets"]))
+        checkFalse(BannerContent.isHistoryControl(role: "AXButton", labels: ["Close"]))
+    }
+
+    func testSystemReceiptPairsPreserveRepeatedMessages() {
+        let merger = SystemNoticeMerger()
+        var notice = Notice(source: "Feishu", title: "Team", body: "Alice\nReady", bundleID: "example.chat")
+        checkTrue(merger.shouldDeliver(notice, from: .banner, at: 0))
+        notice.id = "different-banner"
+        checkTrue(merger.shouldDeliver(notice, from: .banner, at: 1))
+        // New same-text banners remain immediate. Each DB identity pairs only once.
+        notice.id = "database-1"; notice.body = "Alice Ready"
+        checkFalse(merger.shouldDeliver(notice, from: .database, at: 5))
+        notice.id = "database-2"
+        checkFalse(merger.shouldDeliver(notice, from: .database, at: 6))
+        notice.id = "database-3"
+        checkTrue(merger.shouldDeliver(notice, from: .database, at: 7))
+        checkFalse(merger.shouldDeliver(notice, from: .banner, at: 8))
+        notice.body = "Changed"
+        checkTrue(merger.shouldDeliver(notice, from: .banner, at: 9))
+        notice.bundleID = "example.other"; notice.id = "other-database-1"
+        checkTrue(merger.shouldDeliver(notice, from: .database, at: 10))
+        notice.bundleID = "example.chat"; notice.id = "database-4"
+        checkTrue(merger.shouldDeliver(notice, from: .database, at: 40))
+        checkFalse(merger.shouldDeliver(notice, from: .database, at: 80))
+    }
+
+    func testDatabaseBaselineAndRepeatedIdentitiesDoNotReplay() {
+        let merger = SystemNoticeMerger()
+        var old = Notice(id: "old-record", source: "Feishu", title: "Team", body: "Old message", bundleID: "example.chat")
+        merger.rememberExisting([old])
+        checkFalse(merger.shouldDeliver(old, from: .database, at: 0))
+        // An explicitly new banner is not delayed because old text exists in history.
+        old.id = "new-banner-same-text"
+        checkTrue(merger.shouldDeliver(old, from: .banner, at: 1))
+        var fresh = old; fresh.id = "new-banner"; fresh.body = "New message"
+        checkTrue(merger.shouldDeliver(fresh, from: .banner, at: 2))
+        fresh.id = "new-record"
+        checkFalse(merger.shouldDeliver(fresh, from: .database, at: 7))
+        checkFalse(merger.shouldDeliver(fresh, from: .database, at: 8))
+        old.id = "genuinely-new-identical-record"
+        checkFalse(merger.shouldDeliver(old, from: .database, at: 9))
+        checkFalse(merger.shouldDeliver(old, from: .database, at: 300))
+        fresh.id = "newest-record"; fresh.body = "Newest message"
+        checkTrue(merger.shouldDeliver(fresh, from: .database, at: 301))
+        checkFalse(merger.shouldDeliver(fresh, from: .banner, at: 302))
+    }
+
+    func testPreferencesDefaultsPersistenceAndValidation() throws {
+        let name = "notification-tests-" + UUID().uuidString
+        let defaults = try unwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        var preferences = NotificationPreferences.load(from: defaults)
+        let codex = Notice(source: "Codex CLI", title: "待回答", body: "Choose", kind: .input)
+        checkNil(preferences.decision(for: codex).retention.duration)
+        preferences.codex = RetentionPolicy(seconds: 7)
+        preferences.feishu.message = RetentionPolicy(mode: .untilHandled)
+        preferences.feishu.conditions = [.init(kind: .contains, keyword: "发布")]
+        preferences.feishu.filterMessages = true
+        try preferences.save(to: defaults)
+        checkEqual(NotificationPreferences.load(from: defaults), preferences)
+        // Removing the meeting category must not reset an older saved configuration.
+        var legacy = try unwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(preferences)) as? [String: Any])
+        var feishu = try unwrap(legacy["feishu"] as? [String: Any])
+        feishu["meeting"] = ["mode": "timed", "seconds": 9999]
+        feishu["meetingKeywords"] = "旧会议规则"
+        legacy["feishu"] = feishu
+        defaults.set(try JSONSerialization.data(withJSONObject: legacy), forKey: NotificationPreferences.defaultsKey)
+        checkEqual(NotificationPreferences.load(from: defaults), preferences)
+        checkEqual(preferences.decision(for: codex).retention.duration, 7)
+        preferences.codex.seconds = 0
+        checkThrows(try preferences.save(to: defaults))
+        checkEqual(NotificationPreferences.load(from: defaults).codex.seconds, 7)
+        defaults.set(Data("invalid".utf8), forKey: NotificationPreferences.defaultsKey)
+        checkEqual(NotificationPreferences.load(from: defaults), NotificationPreferences())
+    }
+
+    func testFeishuClassificationAndIndependentRetention() {
+        var preferences = NotificationPreferences()
+        preferences.feishu.calendar = RetentionPolicy(seconds: 30)
+        preferences.feishu.other = RetentionPolicy(seconds: 5)
+        var notice = Notice(source: "Feishu", title: "日程提醒", body: "Upcoming", bundleID: "com.electron.lark")
+        checkEqual(preferences.decision(for: notice).feishuType, .calendar)
+        checkEqual(preferences.decision(for: notice).retention.duration, 30)
+        notice.title = "日历助手"; notice.body = "[提醒] 即将开始日程“测试日程”"
+        preferences.feishu.filterMessages = true
+        preferences.feishu.conditions = [.init(keyword: "不匹配的消息条件")]
+        checkEqual(preferences.decision(for: notice).feishuType, .calendar)
+        checkEqual(preferences.decision(for: notice).retention.duration, 30)
+        checkTrue(preferences.decision(for: notice).show)
+        notice.body = "会议即将开始"
+        checkEqual(preferences.decision(for: notice).feishuType, .calendar)
+        notice.title = "新通知"
+        checkEqual(preferences.decision(for: notice).feishuType, .message)
+        checkEqual(FeishuNoticeType.allCases, [.message, .calendar, .other])
+        notice.title = "任务助手"; notice.body = "Task"
+        checkEqual(preferences.decision(for: notice).feishuType, .other)
+        checkEqual(preferences.decision(for: notice).retention.duration, 5)
+        notice.title = "团队"; notice.body = "hello"
+        checkEqual(preferences.decision(for: notice).feishuType, .message)
+        preferences.feishu.calendarKeywords = "\ncustom calendar\n"
+        notice.body = "CUSTOM CALENDAR"
+        checkEqual(preferences.decision(for: notice).feishuType, .calendar)
+        notice.bundleID = "example.other"
+        checkNil(preferences.decision(for: notice).feishuType)
+        checkEqual(preferences.decision(for: notice).retention.duration, 10)
+    }
+
+    func testFeishuMessageFiltersAndClassificationBoundary() {
+        var preferences = NotificationPreferences()
+        preferences.feishu.filterMessages = true
+        preferences.feishu.conditions = [.init(keyword: "Release"), .init(kind: .mentionsMe)]
+        var notice = Notice(source: "飞书", title: "项目群", body: "release ready", bundleID: "com.electron.lark")
+        checkTrue(preferences.decision(for: notice).show)
+        preferences.feishu.matchMode = .all
+        checkFalse(preferences.decision(for: notice).show)
+        preferences.feishu.mentionKeywords = "@Test User"
+        notice.body = "@Test User release ready"
+        checkTrue(preferences.decision(for: notice).show)
+        preferences.feishu.conditions.append(.init(kind: .urgent))
+        checkFalse(preferences.decision(for: notice).show)
+        notice.body = "[加急] @Test User release ready"
+        checkTrue(preferences.decision(for: notice).show)
+        preferences.feishu.conditions[2].enabled = false
+        notice.body = "@Test User release ready"
+        checkTrue(preferences.decision(for: notice).show)
+        notice.body = "日程提醒：下午三点"
+        checkTrue(preferences.decision(for: notice).show) // Message filters never suppress a calendar notice.
+        notice.body = "ordinary"; notice.bundleID = "example.other"
+        checkTrue(preferences.decision(for: notice).show)
+        notice.bundleID = "com.electron.lark"
+        preferences.feishu.conditions = [.init(keyword: "   ")]
+        checkFalse(preferences.decision(for: notice).show)
+        checkNotEqual(preferences.validationError, nil)
+        preferences.feishu.filterMessages = false
+        checkTrue(preferences.decision(for: notice).show)
+        preferences.feishu.filterMessages = true
+        preferences.feishu.conditions = [.init(kind: .urgent)]
+        notice.body = "[⚡加急⚡] 请确认发布计划。"
+        checkTrue(preferences.decision(for: notice).show)
+        notice.body = "[ ⚡\u{FE0F} 加急 ⚡\u{FE0F} ] 请确认发布计划。"
+        checkTrue(preferences.decision(for: notice).show)
+        notice.body = "普通讨论：什么是加急消息？"
+        checkFalse(preferences.decision(for: notice).show)
+        preferences.feishu.conditions = [.init(kind: .mentionsMe)]
+        preferences.feishu.mentionKeywords = FeishuPreferences().mentionKeywords
+        notice.body = "提醒机器人@你: @测试用户 请确认今天的计划。"
+        checkTrue(preferences.decision(for: notice).show)
+        notice.body = "提醒机器人: @其他人 请确认今天的计划。"
+        checkFalse(preferences.decision(for: notice).show)
     }
 
     private func hook(_ event: String, tool: String = "Bash", input: [String: Any] = [:]) throws -> Data {
@@ -316,6 +493,28 @@ final class NotificationCoreTests {
         let duplicate = try run(["new-window", "-d", "-t", original.sessionID, "-n", "duplicate", "-P", "-F", "#{pane_id}", "\(TmuxBridge.shellQuote(fakeCLI.path)) 60"]).trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try run(["select-pane", "-t", duplicate, "-T", "project | \(thread)"])
         checkNil(bridge.capture(sessionID: thread, environment: environment, processID: 1))
+        _ = try run(["kill-pane", "-t", duplicate])
+        _ = try run(["kill-pane", "-t", remote])
+
+        // A task launcher stays in the foreground while its Codex child owns the session title.
+        let launcher = directory.appendingPathComponent("launcher.sh")
+        try Data("#!/bin/sh\n\(TmuxBridge.shellQuote(fakeCLI.path)) 60 &\nwait\n".utf8).write(to: launcher)
+        let wrapped = try run(["new-window", "-d", "-t", original.sessionID, "-n", "wrapped", "-P", "-F", "#{pane_id}", "/bin/sh \(TmuxBridge.shellQuote(launcher.path))"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try run(["select-pane", "-t", wrapped, "-T", "project | \(thread.prefix(26))..."])
+        var wrappedContext: TmuxContext?
+        for _ in 0..<25 {
+            wrappedContext = bridge.capture(sessionID: thread, environment: environment, processID: 1)
+            if wrappedContext != nil { break }
+            usleep(20_000)
+        }
+        checkNotEqual(try run(["display-message", "-p", "-t", wrapped, "#{pane_current_command}"]).trimmingCharacters(in: .whitespacesAndNewlines), "codex")
+        checkEqual(wrappedContext?.paneID, wrapped)
+        checkNil(bridge.capture(sessionID: UUID().uuidString, environment: environment, processID: 1))
+        // Stale matching titles on panes with no Codex process must not become navigation targets.
+        _ = try run(["select-pane", "-t", other, "-T", "project | \(thread)"])
+        checkEqual(bridge.capture(sessionID: thread, environment: environment, processID: 1)?.paneID, wrapped)
+        _ = try run(["kill-pane", "-t", wrapped])
+        checkNil(bridge.capture(sessionID: thread, environment: environment, processID: 1))
         _ = try run(["kill-pane", "-t", original.paneID])
         checkNil(bridge.refreshed(original))
         checkThrows(try bridge.select(original))
@@ -362,6 +561,12 @@ private func unwrap<T>(_ value: T?, file: StaticString = #filePath, line: UInt =
             ("payload parsing and dismissal deduplication", suite.testPayloadChangesAndDismissalDeduplication),
             ("live database inserts, updates, startup baseline", suite.testDatabaseSkipsHistoryButReceivesInsertsAndUpdates),
             ("missing database does not create a file", suite.testMissingDatabaseIsNotCreated),
+            ("banner fields reject mixed cards and unrelated UI", suite.testBannerFieldsDoNotMixCardsOrControls),
+            ("cross-source pairing preserves repeated messages", suite.testSystemReceiptPairsPreserveRepeatedMessages),
+            ("database baseline and repeated identities do not replay", suite.testDatabaseBaselineAndRepeatedIdentitiesDoNotReplay),
+            ("preferences defaults, persistence and validation", suite.testPreferencesDefaultsPersistenceAndValidation),
+            ("Feishu classification and independent retention", suite.testFeishuClassificationAndIndependentRetention),
+            ("Feishu message filters and category boundary", suite.testFeishuMessageFiltersAndClassificationBoundary),
             ("approval lifecycle and payload minimization", suite.testApprovalLifecycleDoesNotStoreCommand),
             ("sync and async input lifecycle", suite.testInputAndAsyncInputLifecycle),
             ("inbox expiry, permissions, consume once", suite.testInboxDiscardsExpiredEventsAndConsumesOnce),

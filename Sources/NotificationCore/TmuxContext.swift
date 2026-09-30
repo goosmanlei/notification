@@ -82,10 +82,21 @@ public struct TmuxBridge {
               let session = Int(fields[fields.count - 1]), session >= 0 else { return nil }
         let socket = fields.dropLast(2).joined(separator: ",")
         let panes = listPanes(socket: socket, serverPID: pid)
+        let processes = Self.processes()
         // A shared app-server inherits the pane that launched it, not the requesting CLI's pane.
         // The CLI's current terminal title can identify the actual session, including /resume switches.
         if let sessionID, UUID(uuidString: sessionID) != nil {
-            let matching = panes.filter { $0.command == "codex" && Self.title($0.title, identifies: sessionID) }
+            let matching = panes.filter { pane in
+                guard Self.title(pane.title, identifies: sessionID) else { return false }
+                if pane.command == "codex" { return true }
+                // Task launchers may be the foreground command while Codex runs below them.
+                // A leftover title on an idle pane is not sufficient evidence.
+                guard let processes else { return false }
+                return processes.contains { process in
+                    URL(fileURLWithPath: process.value.command).lastPathComponent == "codex" &&
+                    Self.ancestors(of: process.key, processes: processes).contains(pane.pid)
+                }
+            }
             let ids = Set(matching.map { $0.context.paneID })
             if ids.count == 1 {
                 return matching.first { $0.context.sessionID == "$\(session)" }?.context ?? matching.first?.context
@@ -93,7 +104,8 @@ public struct TmuxBridge {
             if ids.count > 1 { return nil }
         }
         // Direct CLI hooks can be proven by ancestry. Never trust TMUX_PANE by itself.
-        guard let ancestors = Self.ancestors(of: processID) else { return nil }
+        guard let processes else { return nil }
+        let ancestors = Self.ancestors(of: Int(processID), processes: processes)
         let matching = panes.filter { ancestors.contains($0.pid) }
         guard Set(matching.map { $0.context.paneID }).count == 1 else { return nil }
         return matching.first { $0.context.sessionID == "$\(session)" }?.context ?? matching.first?.context
@@ -113,17 +125,28 @@ public struct TmuxBridge {
         }
     }
 
-    private static func ancestors(of pid: Int32) -> Set<Int>? {
-        guard let output = LocalCommand.run(URL(fileURLWithPath: "/bin/ps"), ["-axo", "pid=,ppid="]) else { return nil }
-        var parents: [Int: Int] = [:]
+    private struct ProcessEntry {
+        var parent: Int
+        var command: String
+    }
+
+    private static func processes() -> [Int: ProcessEntry]? {
+        guard let output = LocalCommand.run(URL(fileURLWithPath: "/bin/ps"), ["-axo", "pid=,ppid=,comm="]) else { return nil }
+        var processes: [Int: ProcessEntry] = [:]
         for row in output.split(separator: "\n") {
-            let values = row.split(whereSeparator: { $0.isWhitespace }).compactMap { Int($0) }
-            if values.count == 2 { parents[values[0]] = values[1] }
+            let values = row.split(maxSplits: 2, omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace })
+            if values.count == 3, let pid = Int(values[0]), let parent = Int(values[1]) {
+                processes[pid] = ProcessEntry(parent: parent, command: String(values[2]))
+            }
         }
-        var result: Set<Int> = []; var current = Int(pid)
+        return processes
+    }
+
+    private static func ancestors(of pid: Int, processes: [Int: ProcessEntry]) -> Set<Int> {
+        var result: Set<Int> = []; var current = pid
         while current > 1, result.count < 64, result.insert(current).inserted {
-            guard let parent = parents[current] else { break }
-            current = parent
+            guard let process = processes[current] else { break }
+            current = process.parent
         }
         return result
     }
