@@ -1,8 +1,9 @@
 import AppKit
 import ServiceManagement
+import UserNotifications
 import NotificationCore
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private let overlays = OverlayController()
     private let worker = DispatchQueue(label: "notification.sources", qos: .utility)
@@ -10,8 +11,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var database: NotificationDatabase?
     private var databaseStatus = "系统通知：正在连接"
     private var hookStatus = "Codex：等待 hook 事件"
+    private var systemTestID: String?
+    private var systemTestStatus: String?
     private var setupWindow: NSWindow?
     private var healthLabel: NSTextField?
+    private var showedPermissionFailure = false
     private var recent: [Notice] = []
     private var isScreenLocked = false
     private var isScreenAsleep = false
@@ -19,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        UNUserNotificationCenter.current().delegate = self
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = Artwork.menu()
         statusItem.button?.toolTip = "Notification · 多屏通知"
@@ -49,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if overlays.dropped > 0 { add(menu, "通知过多：已略过 \(overlays.dropped) 条排队提醒", enabled: false) }
         menu.addItem(.separator())
         add(menu, "显示测试通知", action: #selector(demo))
+        add(menu, "发送系统通知测试", action: #selector(testSystemNotification))
         add(menu, "显示人工介入测试", action: #selector(demoHITL))
         add(menu, overlays.paused ? "恢复浮层提示" : "暂停浮层提示", action: #selector(togglePause))
         add(menu, "清除当前浮层", action: #selector(clear))
@@ -106,6 +112,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let status = latestStatus
             DispatchQueue.main.async {
                 self.databaseStatus = status
+                if status == "系统通知：需要完全磁盘访问", !self.showedPermissionFailure {
+                    self.showedPermissionFailure = true
+                    self.showSetup()
+                }
                 for notice in incoming { self.receive(notice) }
                 for event in events { self.handle(event) }
                 self.updateBadge()
@@ -116,6 +126,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func receive(_ raw: Notice) {
         var notice = raw
+        if notice.bundleID == Bundle.main.bundleIdentifier, let testID = systemTestID,
+           notice.notificationIdentifier == testID {
+            systemTestStatus = "系统测试：已从通知中心读回并展示"
+        }
         if let bundle = notice.bundleID, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
             notice.source = FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
         }
@@ -138,7 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hint = "Notification\n\(databaseStatus)\n\(hookStatus)"
         if statusItem.button?.title != title { statusItem.button?.title = title }
         if statusItem.button?.toolTip != hint { statusItem.button?.toolTip = hint }
-        let health = "\(databaseStatus)\n\(hookStatus) · \(NSScreen.screens.count) 个屏幕"
+        let health = "\(databaseStatus)\n\(hookStatus) · \(NSScreen.screens.count) 个屏幕" + (systemTestStatus.map { "\n" + $0 } ?? "")
         if healthLabel?.stringValue != health { healthLabel?.stringValue = health }
     }
 
@@ -176,6 +190,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func demoHITL() {
         receive(Notice(source: "Codex CLI · 演示", title: "待审批", body: "这是菜单栏生成的测试提醒。", kind: .approval))
     }
+
+    @objc private func testSystemNotification() {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert]) { [weak self] allowed, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard allowed else {
+                    self.systemTestStatus = "系统测试：请在系统通知设置中允许 Notification 发送通知"
+                    if let error { self.systemTestStatus = "系统测试：\(error.localizedDescription)" }
+                    self.updateBadge(); return
+                }
+                let identifier = "notification-test-" + UUID().uuidString
+                self.systemTestID = identifier
+                self.systemTestStatus = "系统测试：已发送，等待从通知中心读回"
+                self.updateBadge()
+                let content = UNMutableNotificationContent()
+                content.title = "系统通知链路测试 · \(identifier.suffix(6))"
+                content.body = "这条消息由 macOS 通知中心投递，再由 Notification 读取并展示。"
+                center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)) { error in
+                    if let error {
+                        DispatchQueue.main.async { self.systemTestStatus = "系统测试：\(error.localizedDescription)"; self.updateBadge() }
+                    }
+                }
+            }
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list])
+    }
+
+    @objc private func testOriginalNotification() {
+        guard let identifier = systemTestID,
+              let notice = recent.first(where: { $0.notificationIdentifier == identifier && $0.bundleID == Bundle.main.bundleIdentifier }) else {
+            systemTestStatus = "原通知测试：请先发送系统通知，等待读回后再点击"; updateBadge(); return
+        }
+        systemTestStatus = "原通知测试：正在定位，等待原应用确认点击"; updateBadge()
+        SystemNotificationOpener.open(notice) { [weak self] error in
+            guard let self, let error else { return }
+            self.systemTestStatus = "原通知测试：\(error)"; self.updateBadge()
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if response.notification.request.identifier == systemTestID,
+           response.actionIdentifier == UNNotificationDefaultActionIdentifier {
+            DispatchQueue.main.async {
+                self.systemTestStatus = "系统测试：已收到此条原通知的默认点击"
+                self.showSetup(); self.updateBadge()
+            }
+        }
+        completionHandler()
+    }
     @objc private func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
@@ -187,7 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showSetup() {
         if let setupWindow { setupWindow.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 550, height: 490),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 550, height: 590),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Notification · 设置与接入"; window.isReleasedWhenClosed = false
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 16
@@ -201,6 +270,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         copy.font = .systemFont(ofSize: 13); copy.preferredMaxLayoutWidth = 490; stack.addArrangedSubview(copy)
         let permissions = NSButton(title: "打开完全磁盘访问设置", target: self, action: #selector(openPermissions))
         stack.addArrangedSubview(permissions)
+        let tests = NSStackView(views: [
+            NSButton(title: "发送系统通知测试", target: self, action: #selector(testSystemNotification)),
+            NSButton(title: "打开最近测试的原通知", target: self, action: #selector(testOriginalNotification))
+        ])
+        tests.spacing = 12; stack.addArrangedSubview(tests)
+        stack.addArrangedSubview(NSButton(title: "打开辅助功能设置（原通知定位）", target: self, action: #selector(openAccessibility)))
         let docs = NSButton(title: "打开接入与验证说明", target: self, action: #selector(openDocs))
         stack.addArrangedSubview(docs)
         let reveal = NSButton(title: "在 Finder 中显示本应用", target: self, action: #selector(revealApp))
@@ -210,6 +285,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func openPermissions() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
+    }
+    @objc private func openAccessibility() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
     @objc private func openDocs() { NSWorkspace.shared.open(URL(string: "https://github.com/goosmanlei/notification#使用")!) }
     @objc private func revealApp() { NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL]) }

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public struct TmuxContext: Codable, Equatable {
     public var socketPath: String
@@ -51,7 +52,14 @@ public struct TmuxBridge {
     public let executable: URL
     private static let separator = "\u{1f}"
     private static let paneFormat = ["#{pid}", "#{session_id}", "#{window_id}", "#{pane_id}",
-                                     "#{session_name}", "#{window_name}", "#{pane_index}"].joined(separator: separator)
+                                     "#{session_name}", "#{window_name}", "#{pane_index}", "#{pane_pid}",
+                                     "#{pane_current_command}", "#{pane_title}"].joined(separator: separator)
+    private struct Pane {
+        var context: TmuxContext
+        var pid: Int
+        var command: String
+        var title: String
+    }
 
     public init(executable: URL) { self.executable = executable }
 
@@ -65,14 +73,59 @@ public struct TmuxBridge {
         return nil
     }
 
-    public func capture(environment: [String: String] = ProcessInfo.processInfo.environment) -> TmuxContext? {
-        guard let raw = environment["TMUX"], let pane = environment["TMUX_PANE"],
-              TmuxContext.validID(pane, prefix: "%") else { return nil }
+    public func capture(sessionID: String? = nil,
+                        environment: [String: String] = ProcessInfo.processInfo.environment,
+                        processID: Int32 = getpid()) -> TmuxContext? {
+        guard let raw = environment["TMUX"] else { return nil }
         let fields = raw.components(separatedBy: ",")
         guard fields.count >= 3, let pid = Int(fields[fields.count - 2]), pid > 0,
               let session = Int(fields[fields.count - 1]), session >= 0 else { return nil }
         let socket = fields.dropLast(2).joined(separator: ",")
-        return lookup(socket: socket, serverPID: pid, paneID: pane, preferredSession: "$\(session)")
+        let panes = listPanes(socket: socket, serverPID: pid)
+        // A shared app-server inherits the pane that launched it, not the requesting CLI's pane.
+        // The CLI's current terminal title can identify the actual session, including /resume switches.
+        if let sessionID, UUID(uuidString: sessionID) != nil {
+            let matching = panes.filter { $0.command == "codex" && Self.title($0.title, identifies: sessionID) }
+            let ids = Set(matching.map { $0.context.paneID })
+            if ids.count == 1 {
+                return matching.first { $0.context.sessionID == "$\(session)" }?.context ?? matching.first?.context
+            }
+            if ids.count > 1 { return nil }
+        }
+        // Direct CLI hooks can be proven by ancestry. Never trust TMUX_PANE by itself.
+        guard let ancestors = Self.ancestors(of: processID) else { return nil }
+        let matching = panes.filter { ancestors.contains($0.pid) }
+        guard Set(matching.map { $0.context.paneID }).count == 1 else { return nil }
+        return matching.first { $0.context.sessionID == "$\(session)" }?.context ?? matching.first?.context
+    }
+
+    private static func title(_ title: String, identifies sessionID: String) -> Bool {
+        // Codex may truncate the UUID in its terminal title. Require at least 24 UUID characters,
+        // an explicit ellipsis for truncation, and a whole title field rather than substring guessing.
+        let expected = sessionID.lowercased()
+        return title.components(separatedBy: "|").contains { field in
+            let value = field.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if value == expected { return true }
+            let suffix = value.hasSuffix("...") ? 3 : (value.hasSuffix("…") ? 1 : 0)
+            guard suffix > 0 else { return false }
+            let prefix = String(value.dropLast(suffix))
+            return prefix.count >= 24 && prefix.count < expected.count && expected.hasPrefix(prefix)
+        }
+    }
+
+    private static func ancestors(of pid: Int32) -> Set<Int>? {
+        guard let output = LocalCommand.run(URL(fileURLWithPath: "/bin/ps"), ["-axo", "pid=,ppid="]) else { return nil }
+        var parents: [Int: Int] = [:]
+        for row in output.split(separator: "\n") {
+            let values = row.split(whereSeparator: { $0.isWhitespace }).compactMap { Int($0) }
+            if values.count == 2 { parents[values[0]] = values[1] }
+        }
+        var result: Set<Int> = []; var current = Int(pid)
+        while current > 1, result.count < 64, result.insert(current).inserted {
+            guard let parent = parents[current] else { break }
+            current = parent
+        }
+        return result
     }
 
     public func refreshed(_ context: TmuxContext) -> TmuxContext? {
@@ -82,17 +135,21 @@ public struct TmuxBridge {
     }
 
     private func lookup(socket: String, serverPID: Int, paneID: String, preferredSession: String) -> TmuxContext? {
+        let matches = listPanes(socket: socket, serverPID: serverPID).map(\.context).filter { $0.paneID == paneID }
+        return matches.first { $0.sessionID == preferredSession } ?? matches.first
+    }
+
+    private func listPanes(socket: String, serverPID: Int) -> [Pane] {
         guard socket.hasPrefix("/"), !socket.contains("\0"),
-              let output = LocalCommand.run(executable, ["-S", socket, "list-panes", "-a", "-F", Self.paneFormat]) else { return nil }
-        let matches = output.split(separator: "\n").compactMap { row -> TmuxContext? in
+              let output = LocalCommand.run(executable, ["-S", socket, "list-panes", "-a", "-F", Self.paneFormat]) else { return [] }
+        return output.split(separator: "\n").compactMap { row -> Pane? in
             let fields = row.components(separatedBy: Self.separator)
-            guard fields.count == 7, Int(fields[0]) == serverPID, fields[3] == paneID,
-                  let index = Int(fields[6]) else { return nil }
+            guard fields.count == 10, Int(fields[0]) == serverPID,
+                  let index = Int(fields[6]), let panePID = Int(fields[7]) else { return nil }
             let context = TmuxContext(socketPath: socket, serverPID: serverPID, sessionID: fields[1],
                 windowID: fields[2], paneID: fields[3], sessionName: fields[4], windowName: fields[5], paneIndex: index)
-            return context.isValid ? context : nil
+            return context.isValid ? Pane(context: context, pid: panePID, command: fields[8], title: fields[9]) : nil
         }
-        return matches.first { $0.sessionID == preferredSession } ?? matches.first
     }
 
     public func select(_ context: TmuxContext) throws -> TmuxContext {

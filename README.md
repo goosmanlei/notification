@@ -10,12 +10,12 @@ macOS 菜单栏工具：将系统通知同步镜像到所有连接屏幕的上�
 
 ## 能做什么
 
-- 每个连接屏幕同时显示浮层；默认宽 880 点、卡片高 156 点，较窄屏幕会限制宽度。普通提醒约 10 秒后消失，人工介入提醒保留到处理或手动关闭。
+- 每个连接屏幕同时显示浮层；默认宽 880 点，高度随内容收紧、最高 156 点，较窄屏幕会限制宽度。普通提醒约 10 秒后消失，人工介入提醒保留到处理或手动关闭。
 - 浮层不会主动抢占键盘焦点；任意屏幕关闭一条提醒，会同步关闭其他屏幕上的同一条。
 - 常驻菜单栏，提供暂停、隐藏内容、测试提醒、最近提醒和可选的登录启动。
 - 首次连接通知数据库只建立基线，不把已有历史通知重新弹出；新增通知和内容更新会被检测。
 - Codex hooks 在审批、提问前发送提醒，在相应工具完成或会话继续后清除。通知工具不返回审批决定。
-- Codex 提醒突出项目名，并可显示 `session-name/window-name/pane-N`，提供「打开 tmux」按钮。
+- 顶栏集中展示项目名、`session-name/window-name/pane-N`、状态与操作；金色状态标签和蓝色按钮分开呈现，底部不预留操作栏。
 
 菜单栏图形为自行绘制的「提示灯＋双屏」，矢量源代码见 [Artwork.swift](Sources/NotificationApp/Artwork.swift)。
 
@@ -39,16 +39,21 @@ open /Applications/Notification.app
 
 首次安装及后续更新统一使用 `/Applications/Notification.app`。更新前先从菜单栏退出应用，再执行上述命令。
 
-本地构建使用临时签名，未作 Developer ID 签名或公证。重新构建并替换应用后，系统可能要求重新授予权限。
+本地构建使用临时签名，未作 Developer ID 签名或公证。重新构建并替换应用后，系统可能要求重新授予权限。若辅助功能开关已开而应用仍提示未授权，移除列表中的 Notification，再添加 `/Applications/Notification.app`；完全磁盘访问则需重新开启并退出重开应用。以应用实际测试结果为准。
 
 ### 接收系统通知
 
 1. 点击菜单栏 Notification 图标，选择「设置与接入说明」。
 2. 在系统设置的「隐私与安全性 → 完全磁盘访问」中添加并开启 `Notification.app`。
 3. 退出并重新打开 Notification，确认菜单显示「系统通知：监听中（实验性）」。
-4. 用常用应用产生一条**新的**真实通知，检查系统和所有屏幕上的浮层是否都出现。菜单中的「显示测试通知」只检验浮层，不检验系统通知采集。
+4. 点击「发送系统通知测试」，首次使用时允许本应用发送通知。设置中出现「已从通知中心读回并展示」才表示这条测试消息通过了 macOS 投递、数据库读取和浮层展示链路。「显示测试通知」仍只检验浮层。
+5. 用常用应用各产生一条**新的**真实通知，检查系统和所有屏幕上的浮层是否都出现；单条测试成功不能证明所有应用的覆盖率。
 
 保留原应用的通知权限和通知中心设置。关闭原应用通知后，本工具无法替它接收消息。隐藏预览的通知只能显示系统实际提供的内容。
+
+「打开原通知」是实验性消息定位入口，需要为 Notification 开启「隐私与安全性 → 辅助功能」。它尝试找到并点击通知中心里的原始卡片，由原应用处理通知点击；不拼接或猜测消息链接。若匹配到可识别的折叠通知组，会先展开再定位具体消息。原卡片已清除、文字无法匹配、藏在无法识别的组内或存在多条相同通知时，可能无法定位；失败后可选择「打开应用」，此退路只激活应用。辅助功能界面结构随系统版本变化，支持范围以实际验证为准。
+
+可在设置中先「发送系统通知测试」，等待读回后再「打开最近测试的原通知」。出现「已收到此条原通知的默认点击」，才表示本应用收到该消息的真实点击回调；这不代表已验收其他应用的内部页面定位。
 
 ### 接收 Codex CLI 人工介入提醒
 
@@ -69,7 +74,7 @@ python3 scripts/install-codex-hooks.py
 
 浮层顶部显示项目目录名。`~/codex-path/<group>/<project>/` 内的工作目录显示 `<group>/<project>`，子目录也归到该项目；其他目录优先显示 Git 仓库根目录名，否则显示当前目录名。普通系统通知没有工作目录信息时只展示应用来源。
 
-Codex 从 tmux pane 启动且继承了 `TMUX`、`TMUX_PANE` 环境变量时，提醒会附带 `session-name/window-name/pane-N`。「打开 tmux」重新核对 pane，切换对应的 session、window 和 pane，并激活已有终端；没有可复用的终端时，通过系统 Terminal 连接。终端有多个窗口或标签时，激活应用后可能仍需手动选中对应窗口。pane 已关闭或 tmux 服务已重启时会显示失败原因。
+tmux 定位优先把 hook 的会话编号与当前 Codex pane 标题匹配；直接启动的 CLI 还可通过进程父子关系确认来源。共享后台服务的 `TMUX_PANE` 可能属于另一个会话，因此不再单独采用它。标题没有会话编号、截断过短或多个 pane 同时匹配时，不猜测位置，保留项目提醒和恢复命令。确认来源后显示 `session-name/window-name/pane-N`。「打开 tmux」重新核对 pane，切换对应的 session、window 和 pane，并激活已有终端；没有可复用的终端时，通过系统 Terminal 连接。终端有多个窗口或标签时，激活应用后可能仍需手动选中对应窗口。pane 已关闭或 tmux 服务已重启时会显示失败原因。
 
 未取得 tmux 定位信息或跳转失败时，可用「复制恢复命令」复制 `codex resume <session-id>`。审批和回答仍在 Codex 终端完成。卡片仅保留项目、终端位置、简短状态和实际问题或审批说明，移除了「同步通知」「请回到 Codex 终端处理」等固定尾注。
 
@@ -109,6 +114,7 @@ python3 scripts/install-codex-hooks.py --remove
 - [HookEvent.swift](Sources/NotificationCore/HookEvent.swift)：Codex 事件解析及本机消息传递。
 - [ProjectContext.swift](Sources/NotificationCore/ProjectContext.swift)、[TmuxContext.swift](Sources/NotificationCore/TmuxContext.swift)：项目名称与 tmux 定位。
 - [TmuxNavigator.swift](Sources/NotificationApp/TmuxNavigator.swift)：终端激活及连接。
+- [SystemNotificationOpener.swift](Sources/NotificationApp/SystemNotificationOpener.swift)：辅助功能原通知点击与安全退路。
 - [OverlayController.swift](Sources/NotificationApp/OverlayController.swift)：多屏浮层与队列。
 - [AppDelegate.swift](Sources/NotificationApp/AppDelegate.swift)：菜单栏、数据源和系统状态。
 
