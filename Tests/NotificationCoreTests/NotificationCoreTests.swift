@@ -135,6 +135,93 @@ final class NotificationCoreTests {
         checkEqual(LocalCommand.run(URL(fileURLWithPath: "/usr/bin/printf"), ["%s", "literal; $(printf injected)"]), "literal; $(printf injected)")
     }
 
+    func testSourceMonitorWakesOnWALCommitsWithoutWaitingForFallback() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("db")
+        var writer: OpaquePointer?
+        checkEqual(sqlite3_open(path.path, &writer), SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        checkEqual(sqlite3_exec(writer, "PRAGMA journal_mode=WAL; CREATE TABLE record(rec_id INTEGER PRIMARY KEY, data BLOB)", nil, nil, nil), SQLITE_OK)
+        let data = try payload()
+        func insert(_ id: Int) {
+            var statement: OpaquePointer?
+            checkEqual(sqlite3_prepare_v2(writer, "INSERT INTO record VALUES (?, ?)", -1, &statement, nil), SQLITE_OK)
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_int(statement, 1, Int32(id))
+            _ = data.withUnsafeBytes { sqlite3_bind_blob(statement, 2, $0.baseAddress, Int32(data.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+            checkEqual(sqlite3_step(statement), SQLITE_DONE)
+        }
+        insert(1)
+        let ready = DispatchSemaphore(value: 0), received = DispatchSemaphore(value: 0)
+        let queue = DispatchQueue(label: "test.notification.wal")
+        let reader = NotificationDatabase(path: path)
+        var reasons: [SourceMonitor.Reason] = [], failuresToRead = 0
+        let monitor = SourceMonitor(paths: [path, URL(fileURLWithPath: path.path + "-wal"), directory],
+                                    queue: queue, fallbackInterval: 60) { reason in
+            do {
+                for _ in try reader.poll() { reasons.append(reason); received.signal() }
+            } catch { failuresToRead += 1 }
+            if reason == .initial { ready.signal() }
+        }
+        monitor.start()
+        defer { monitor.stop(); queue.sync {} }
+        checkEqual(ready.wait(timeout: .now() + 2), .success)
+        var samples: [Double] = []
+        for id in 2...9 {
+            let start = ProcessInfo.processInfo.systemUptime
+            insert(id)
+            checkEqual(received.wait(timeout: .now() + 2), .success)
+            samples.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+        }
+        queue.sync {
+            checkEqual(failuresToRead, 0); checkEqual(reasons.count, 8)
+            checkTrue(reasons.allSatisfy { $0 == .fileChange })
+        }
+        let sorted = samples.sorted()
+        let median = (sorted[(sorted.count - 1) / 2] + sorted[sorted.count / 2]) / 2
+        print(String(format: "WAL commit-to-read: n=%d, median=%.1f ms, max=%.1f ms (60 s fallback not used)", sorted.count, median, sorted.last!))
+    }
+
+    func testSourceMonitorHandlesLateFilesReplacementAndFallback() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("events")
+        let ready = DispatchSemaphore(value: 0), received = DispatchSemaphore(value: 0)
+        let queue = DispatchQueue(label: "test.notification.files")
+        var latest = ""
+        let monitor = SourceMonitor(paths: [path, directory], queue: queue, fallbackInterval: 60) { reason in
+            if let text = try? String(contentsOf: path), text != latest { latest = text; received.signal() }
+            if reason == .initial { ready.signal() }
+        }
+        monitor.start()
+        checkEqual(ready.wait(timeout: .now() + 2), .success)
+        // The watched file does not exist at startup, then is atomically replaced twice.
+        for text in ["first", "replacement"] {
+            try text.write(to: path, atomically: true, encoding: .utf8)
+            checkEqual(received.wait(timeout: .now() + 2), .success)
+        }
+        let handle = try FileHandle(forWritingTo: path)
+        try handle.seekToEnd(); try handle.write(contentsOf: Data("-append".utf8)); try handle.close()
+        checkEqual(received.wait(timeout: .now() + 2), .success)
+        queue.sync { checkEqual(latest, "replacement-append") }
+        monitor.stop(); queue.sync {}
+
+        // Missing vnode coverage must still poll on every healthy fallback tick.
+        let fallback = SourceMonitor(paths: [], queue: queue, fallbackInterval: 0.1) { reason in
+            if reason == .initial { ready.signal() }
+            if reason == .fallback { received.signal() }
+        }
+        fallback.start()
+        defer { fallback.stop(); queue.sync {} }
+        checkEqual(ready.wait(timeout: .now() + 2), .success)
+        let start = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<3 { checkEqual(received.wait(timeout: .now() + 1), .success) }
+        checkTrue(ProcessInfo.processInfo.systemUptime - start < 0.6)
+    }
+
     func testTmuxCaptureNavigationAndStaleTargetsOnIsolatedServer() throws {
         guard let bridge = TmuxBridge.installed() else { print("SKIP isolated tmux integration: tmux unavailable"); return }
         let directory = URL(fileURLWithPath: "/tmp/notification tests,'\(UUID().uuidString)")
@@ -281,6 +368,8 @@ private func unwrap<T>(_ value: T?, file: StaticString = #filePath, line: UInt =
             ("project labels and managed path boundaries", suite.testProjectLabelsRespectManagedBoundaryAndRepositoryRoots),
             ("compact content and legacy event decoding", suite.testCompactHookContentAndBackwardCompatibility),
             ("local command timeout and literal arguments", suite.testCommandTimeoutAndLiteralArguments),
+            ("WAL writes wake source reads without fallback", suite.testSourceMonitorWakesOnWALCommitsWithoutWaitingForFallback),
+            ("source monitor late creation, replacement and fallback", suite.testSourceMonitorHandlesLateFilesReplacementAndFallback),
             ("isolated tmux capture, navigation, rename and stale pane", suite.testTmuxCaptureNavigationAndStaleTargetsOnIsolatedServer)
         ]
         for (name, test) in tests {
