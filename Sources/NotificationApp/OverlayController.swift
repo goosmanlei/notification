@@ -53,14 +53,15 @@ final class OverlayController {
     struct Active {
         var notice: Notice
         var deadline: Date?
+        let duration: TimeInterval?
     }
+    private struct Pending { let notice: Notice; let retention: RetentionPolicy }
     private var active: [Active] = []
-    private var waiting: [Notice] = []
+    private var waiting: [Pending] = []
     private var panels: [NSPanel] = []
     private var timer: Timer?
     var paused = false { didSet { if paused { clear() }; render() } }
     var locked = false { didSet { if locked { clear() }; render() } }
-    var duration: TimeInterval = 10
     var hideBody = false { didSet { render() } }
     var onChange: (() -> Void)?
     private(set) var dropped = 0
@@ -72,45 +73,47 @@ final class OverlayController {
                                               object: nil, queue: .main) { [weak self] _ in self?.render() }
     }
 
-    func show(_ notice: Notice) {
+    func show(_ notice: Notice, retention: RetentionPolicy? = nil) {
         guard !paused, !locked else { return }
-        guard !active.contains(where: { $0.notice.id == notice.id }), !waiting.contains(where: { $0.id == notice.id }) else { return }
+        guard !active.contains(where: { $0.notice.id == notice.id }), !waiting.contains(where: { $0.notice.id == notice.id }) else { return }
         if waiting.count >= 100 {
-            if let index = waiting.firstIndex(where: { !$0.requiresAction }) { waiting.remove(at: index) }
+            if let index = waiting.firstIndex(where: { $0.retention.duration != nil }) { waiting.remove(at: index) }
             else { waiting.removeFirst() }
             dropped += 1
         }
-        if notice.requiresAction { waiting.insert(notice, at: 0) } else { waiting.append(notice) }
+        let item = Pending(notice: notice, retention: retention ?? RetentionPolicy(mode: notice.requiresAction ? .untilHandled : .timed))
+        if notice.requiresAction { waiting.insert(item, at: 0) } else { waiting.append(item) }
         fill(); render(); onChange?()
     }
 
     func resolve(id: String) {
-        guard active.contains(where: { $0.notice.id == id }) || waiting.contains(where: { $0.id == id }) else { return }
-        active.removeAll { $0.notice.id == id }; waiting.removeAll { $0.id == id }
+        guard active.contains(where: { $0.notice.id == id }) || waiting.contains(where: { $0.notice.id == id }) else { return }
+        active.removeAll { $0.notice.id == id }; waiting.removeAll { $0.notice.id == id }
         fill(); render(); onChange?()
     }
 
     private func setActionInProgress(id: String, _ inProgress: Bool) {
-        guard let index = active.firstIndex(where: { $0.notice.id == id }), !active[index].notice.requiresAction else { return }
-        active[index].deadline = inProgress ? nil : Date().addingTimeInterval(duration)
+        guard let index = active.firstIndex(where: { $0.notice.id == id }) else { return }
+        active[index].deadline = inProgress ? nil : active[index].duration.map { Date().addingTimeInterval($0) }
     }
 
     func clear(session: String? = nil) {
         if let session {
-            guard active.contains(where: { $0.notice.sessionID == session }) || waiting.contains(where: { $0.sessionID == session }) else { return }
-            active.removeAll { $0.notice.sessionID == session }; waiting.removeAll { $0.sessionID == session }
+            guard active.contains(where: { $0.notice.sessionID == session }) || waiting.contains(where: { $0.notice.sessionID == session }) else { return }
+            active.removeAll { $0.notice.sessionID == session }; waiting.removeAll { $0.notice.sessionID == session }
         } else { active = []; waiting = [] }
         fill(); render(); onChange?()
     }
 
     private func fill() {
-        // Leave room for ordinary notifications when several human-input requests remain open.
+        // Reserve a slot for timed notifications even when Codex or Feishu cards persist.
         while active.count < 3, !waiting.isEmpty {
-            let persistent = active.filter { $0.notice.requiresAction }.count
-            let index = persistent >= 2 ? waiting.firstIndex(where: { !$0.requiresAction }) : waiting.startIndex
+            let persistent = active.filter { $0.duration == nil }.count
+            let index = persistent >= 2 ? waiting.firstIndex(where: { $0.retention.duration != nil }) : waiting.startIndex
             guard let index else { break }
-            let notice = waiting.remove(at: index)
-            active.append(Active(notice: notice, deadline: notice.requiresAction ? nil : Date().addingTimeInterval(duration)))
+            let item = waiting.remove(at: index)
+            let duration = item.retention.duration
+            active.append(Active(notice: item.notice, deadline: duration.map { Date().addingTimeInterval($0) }, duration: duration))
         }
     }
 
@@ -172,6 +175,13 @@ private struct NoticeCard: View {
     @ViewState private var isOpeningApplication = false
     @ViewState private var navigationError: String?
     private var accent: Color { notice.requiresAction ? Color(red: 0.98, green: 0.70, blue: 0.26) : Color(red: 0.36, green: 0.86, blue: 0.78) }
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -188,14 +198,18 @@ private struct NoticeCard: View {
                         .lineLimit(1).truncationMode(.middle).layoutPriority(1)
                 }
                 Spacer(minLength: 4)
+                Text(Self.timeFormatter.string(from: notice.createdAt))
+                    .font(.system(size: 12)).monospacedDigit().foregroundStyle(.white.opacity(0.65))
+                    .fixedSize().help("通知时间：" + notice.createdAt.formatted(date: .numeric, time: .standard))
+                    .accessibilityLabel("通知时间 " + Self.timeFormatter.string(from: notice.createdAt))
                 if notice.requiresAction {
                     Text(notice.title).font(.system(size: 12, weight: .medium)).foregroundStyle(accent)
                         .padding(.horizontal, 8).padding(.vertical, 4)
                         .background(accent.opacity(0.13), in: Capsule()).fixedSize()
                 }
                 actions.fixedSize()
-                Button(action: dismiss) { Image(systemName: "xmark").font(.system(size: 11, weight: .semibold)).padding(4) }
-                    .buttonStyle(.plain).help("在所有屏幕关闭此提醒")
+                Button(action: dismiss) { Image(systemName: "xmark").font(.system(size: 13, weight: .semibold)) }
+                    .buttonStyle(NoticeDismissStyle()).help("在所有屏幕关闭此提醒")
                     .accessibilityLabel("关闭提醒")
             }
             if !notice.requiresAction {
@@ -248,6 +262,20 @@ private struct NoticeCard: View {
             }
         }
         .buttonStyle(NoticeActionStyle()).font(.system(size: 12, weight: .semibold))
+    }
+}
+
+private struct NoticeDismissStyle: ButtonStyle {
+    @ViewState private var isHovered = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(width: 40, height: 40)
+            .background(.white.opacity(configuration.isPressed ? 0.24 : (isHovered ? 0.16 : 0.07)),
+                        in: RoundedRectangle(cornerRadius: 10))
+            // Include the space around the symbol in hit testing, including the corners.
+            .contentShape(Rectangle())
+            .onHover { isHovered = $0 }
     }
 }
 

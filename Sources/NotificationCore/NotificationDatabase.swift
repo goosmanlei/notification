@@ -15,10 +15,18 @@ public final class NotificationDatabase {
     private var primed = false
     private var lastVersion: Int64?
     private var identity: String?
+    private var hasDeliveredDate = false
+    private var baseline: [Notice] = []
     public let path: URL
 
     public init(path: URL) { self.path = path }
     deinit { if let db { sqlite3_close(db) } }
+
+    /// Transient startup/replacement snapshot for suppressing historical UI cards.
+    public func takeBaseline() -> [Notice] {
+        defer { baseline = [] }
+        return baseline
+    }
 
     public func poll() throws -> [Notice] {
         let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
@@ -32,24 +40,32 @@ public final class NotificationDatabase {
         let version = try scalar("PRAGMA data_version")
         if lastVersion == version { return [] }
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT rec_id, data FROM record ORDER BY rec_id", -1, &statement, nil) == SQLITE_OK else {
+        let dateColumn = hasDeliveredDate ? "delivered_date" : "NULL"
+        guard sqlite3_prepare_v2(db, "SELECT rec_id, data, \(dateColumn) FROM record ORDER BY rec_id", -1, &statement, nil) == SQLITE_OK else {
             throw failure("不支持此版本的通知数据库")
         }
         defer { sqlite3_finalize(statement) }
         var next: [Int64: String] = [:]
-        var notices: [Notice] = []
+        var notices: [Notice] = [], existing: [Notice] = []
         var result = sqlite3_step(statement)
         while result == SQLITE_ROW {
             let recordID = sqlite3_column_int64(statement, 0)
             let count = Int(sqlite3_column_bytes(statement, 1))
+            let dateType = sqlite3_column_type(statement, 2)
+            let timestamp = sqlite3_column_double(statement, 2)
+            let deliveredAt = (dateType == SQLITE_FLOAT || dateType == SQLITE_INTEGER) && timestamp.isFinite && timestamp > 0
+                && timestamp <= Date().timeIntervalSinceReferenceDate + 86_400
+                ? Date(timeIntervalSinceReferenceDate: timestamp) : nil
             if count > 0, count <= 1_048_576, let bytes = sqlite3_column_blob(statement, 1),
-               let notice = PayloadParser.parse(Data(bytes: bytes, count: count), recordID: recordID) {
+               let notice = PayloadParser.parse(Data(bytes: bytes, count: count), recordID: recordID, deliveredAt: deliveredAt) {
                 next[recordID] = notice.id
                 if primed && signatures[recordID] != notice.id { notices.append(notice) }
+                if !primed { existing.append(notice) }
             }
             result = sqlite3_step(statement)
         }
         guard result == SQLITE_DONE else { throw failure("通知数据库读取失败") }
+        if !primed { baseline = existing }
         signatures = next; primed = true; lastVersion = version
         return notices
     }
@@ -78,6 +94,8 @@ public final class NotificationDatabase {
             sqlite3_close(db); db = nil
             throw error
         }
+        // Older schemas may omit the system delivery time. Keep those readable.
+        hasDeliveredDate = sqlite3_table_column_metadata(db, nil, "record", "delivered_date", nil, nil, nil, nil, nil) == SQLITE_OK
     }
 
     private func scalar(_ sql: String) throws -> Int64 {

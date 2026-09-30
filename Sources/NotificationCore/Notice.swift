@@ -33,7 +33,7 @@ public func digest(_ data: Data) -> String {
 
 public enum PayloadParser {
     /// Parse the experimental Notification Center binary plist without retaining its raw payload.
-    public static func parse(_ data: Data, recordID: Int64) -> Notice? {
+    public static func parse(_ data: Data, recordID: Int64, deliveredAt: Date? = nil) -> Notice? {
         guard data.count <= 1_048_576,
               let root = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
         else { return nil }
@@ -51,6 +51,7 @@ public enum PayloadParser {
         return Notice(id: "system:\(recordID):\(signature)", source: bundleID ?? "系统通知",
                       title: String(title.prefix(200)),
                       body: text.isEmpty ? "该应用未提供可显示的通知内容" : String(text.prefix(2000)),
+                      createdAt: deliveredAt ?? (root["date"] as? Date) ?? Date(),
                       bundleID: bundleID, notificationIdentifier: request["iden"] as? String)
     }
 }
