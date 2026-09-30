@@ -24,7 +24,7 @@ macOS 菜单栏工具：将系统通知同步镜像到所有连接屏幕的上�
 
 ## 使用
 
-### 构建和运行
+### 构建、安装与更新
 
 需要 Swift 工具链与 macOS Command Line Tools，无第三方包依赖。应用的最低构建目标为 macOS 13；不同 macOS 通知数据库的兼容性需要单独验证。
 
@@ -32,10 +32,11 @@ macOS 菜单栏工具：将系统通知同步镜像到所有连接屏幕的上�
 
 ```bash
 ./scripts/build-app.sh
-mkdir -p "$HOME/Applications"
-ditto build/Notification.app "$HOME/Applications/Notification.app"
-open "$HOME/Applications/Notification.app"
+ditto build/Notification.app /Applications/Notification.app
+open /Applications/Notification.app
 ```
+
+首次安装及后续更新统一使用 `/Applications/Notification.app`。更新前先从菜单栏退出应用，再执行上述命令。
 
 本地构建使用临时签名，未作 Developer ID 签名或公证。重新构建并替换应用后，系统可能要求重新授予权限。
 
@@ -56,7 +57,7 @@ HITL（Human in the Loop）是需要你审批操作或回答问题的时刻。�
 python3 scripts/install-codex-hooks.py
 ```
 
-安装器会合并当前 `CODEX_HOME`（未设置时为 `~/.codex`）的 `hooks.json`，保留已有 hooks。若应用不在默认位置，增加 `--app '/实际位置/Notification.app'`；先预览可加 `--dry-run`。
+安装器默认引用 `/Applications/Notification.app`，合并当前 `CODEX_HOME`（未设置时为 `~/.codex`）的 `hooks.json`，保留已有 hooks。若应用不在默认位置，增加 `--app '/实际位置/Notification.app'`；先预览可加 `--dry-run`。
 
 在 Codex CLI 中输入 **`/hooks`**，检查并信任新增的 Notification hooks。安装脚本不会代你标记信任。打开新的 CLI 会话，分别验证一次真实的审批和提问；部分专用工具路径可能不触发通用 hooks。
 

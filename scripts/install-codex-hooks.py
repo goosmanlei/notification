@@ -45,7 +45,7 @@ def merge(document, command, remove=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--app", type=Path, default=Path.home() / "Applications/Notification.app")
+    parser.add_argument("--app", type=Path, default=Path("/Applications/Notification.app"))
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
     parser.add_argument("--remove", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
