@@ -8,9 +8,12 @@ if CommandLine.arguments.contains("--codex-hook") {
         guard let part = try? FileHandle.standardInput.read(upToCount: min(65_536, 1_048_577 - data.count)), !part.isEmpty else { break }
         data.append(part)
     }
-    if var event = CodexHook.parse(data) {
-        if event.action == .show { event.notice?.tmux = TmuxBridge.installed()?.capture(sessionID: event.sessionID) }
-        try? EventInbox.write(event)
+    if let raw = CodexHook.parse(data) {
+        let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        if let event = CodexSessionContext.route(raw, transcriptPath: root?["transcript_path"] as? String,
+                                                tmuxResolver: { TmuxBridge.installed()?.capture(sessionID: $0) }) {
+            try? EventInbox.write(event)
+        }
     }
     exit(0)
 }

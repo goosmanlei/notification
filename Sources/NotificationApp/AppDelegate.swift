@@ -30,6 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var healthLabel: NSTextField?
     private var showedPermissionFailure = false
     private var recent: [Notice] = []
+    private var completedTurns: [String] = []
+    private var pendingApprovals = PendingApprovalNotices()
     private var isScreenLocked = false
     private var isScreenAsleep = false
     private var isSessionInactive = false
@@ -113,6 +115,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         sourceMonitor = SourceMonitor(paths: watched, queue: worker) { [weak self] _ in
             guard let self else { return }
             let events = EventInbox.drain()
+            // Query tmux off the UI thread while preserving hook delivery order,
+            // including resolve/clear events that must still run when shows are filtered.
+            let (checkForeground, foregroundPID): (Bool, Int32?) = events.isEmpty ? (false, nil) : DispatchQueue.main.sync {
+                (self.preferences.suppressForegroundTmuxWindow,
+                 NSWorkspace.shared.frontmostApplication?.processIdentifier)
+            }
+            let foregroundWindows = events.map { event -> Bool in
+                guard checkForeground, let foregroundPID, let context = event.notice?.tmux,
+                      let bridge = TmuxBridge.installed() else { return false }
+                return bridge.isInForegroundWindow(context, foregroundProcessID: foregroundPID)
+            }
             var incoming: [Notice] = []
             if ProcessInfo.processInfo.systemUptime >= nextAttempt {
                 do {
@@ -140,7 +153,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     self.showSetup()
                 }
                 for notice in incoming { self.receiveSystem(notice, from: .database) }
-                for event in events { self.handle(event) }
+                for (event, foregroundWindow) in zip(events, foregroundWindows) {
+                    let stillForeground = foregroundPID == NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    self.handle(event, isForegroundTmuxWindow: foregroundWindow && stillForeground)
+                }
+                // Process cancellation in this batch before releasing delayed approvals.
+                self.releasePendingApprovals()
                 self.updateBadge()
             }
         }
@@ -149,7 +167,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func receiveSystem(_ raw: Notice, from channel: SystemNoticeMerger.Channel) {
         var notice = raw
-        if let bundleID = notice.bundleID { rememberApplication(bundleID) }
         if channel == .banner {
             // Feishu's helper is also named Notification. The unique active test title
             // identifies our own test without guessing the source of ordinary banners.
@@ -169,7 +186,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let fast = systemTestBannerMS.map { "横幅 \($0) 毫秒" } ?? "横幅未捕获"
             let fallback = systemTestDatabaseMS.map { "数据库 \($0) 毫秒" } ?? "等待读回数据库"
             systemTestStatus = "系统测试：\(fast) · \(fallback)"
+            updateBadge()
+            return // Explicit diagnostics never enter the notification queue or recent list.
         }
+        guard preferences.acceptsSource(notice) else { return }
+        if let bundleID = notice.bundleID { rememberApplication(bundleID) }
         let allowed = preferences.decision(for: notice).show
         let deliver = allowed && systemMerger.shouldDeliver(notice, from: channel)
         let source = notice.bundleID ?? "unknown"
@@ -204,9 +225,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return matches.first
     }
 
-    private func receive(_ raw: Notice) {
+    private func receive(_ raw: Notice, isForegroundTmuxWindow: Bool = false) {
         var notice = raw
-        let decision = preferences.decision(for: notice)
+        let decision = preferences.decision(for: notice, isForegroundTmuxWindow: isForegroundTmuxWindow)
         guard decision.show else { return }
         if let bundle = notice.bundleID, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
             notice.source = FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
@@ -216,12 +237,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         overlays.show(notice, retention: decision.retention)
     }
 
-    private func handle(_ event: HookEvent) {
+    private func handle(_ event: HookEvent, isForegroundTmuxWindow: Bool = false) {
         hookStatus = "Codex：已收到 hook 事件"
+        let kind = event.notice?.kind.rawValue ?? "none"
+        let client = event.notice?.codexClient?.rawValue ?? "unknown"
+        let allowed = event.notice.map { preferences.decision(for: $0, isForegroundTmuxWindow: isForegroundTmuxWindow).show } ?? false
+        let eventID = String(digest(Data(event.key.utf8)).prefix(12))
+        // No question text, command, working directory or transcript in diagnostics.
+        deliveryLog.info("hook action=\(event.action.rawValue, privacy: .public) kind=\(kind, privacy: .public) client=\(client, privacy: .public) allowed=\(allowed) event=\(eventID, privacy: .public)")
         switch event.action {
-        case .show: if let notice = event.notice { receive(notice) }
-        case .resolve: overlays.resolve(id: event.key)
-        case .clearSession: overlays.clear(session: event.sessionID)
+        case .show:
+            guard let notice = event.notice else { return }
+            if notice.kind == .approval && notice.codexClient == .desktop {
+                guard allowed, !overlays.paused, !overlays.locked else { return }
+                pendingApprovals.hold(event, now: ProcessInfo.processInfo.systemUptime)
+                deliveryLog.info("approval stage=deferred event=\(eventID, privacy: .public)")
+            } else { receive(notice, isForegroundTmuxWindow: isForegroundTmuxWindow) }
+        case .resolve:
+            pendingApprovals.resolve(key: event.key)
+            recent.removeAll { $0.id == event.key && $0.requiresAction }
+            overlays.resolve(id: event.key)
+        case .clearSession:
+            pendingApprovals.clear(session: event.sessionID)
+            recent.removeAll { $0.sessionID == event.sessionID && $0.requiresAction }
+            overlays.clear(session: event.sessionID)
+        case .complete:
+            guard !completedTurns.contains(event.key) else { return }
+            completedTurns.append(event.key)
+            if completedTurns.count > 256 { completedTurns.removeFirst() }
+            pendingApprovals.clear(session: event.sessionID)
+            recent.removeAll { $0.sessionID == event.sessionID && $0.requiresAction }
+            overlays.clear(session: event.sessionID)
+            if let notice = event.notice { receive(notice, isForegroundTmuxWindow: isForegroundTmuxWindow) }
+        case .endSession:
+            pendingApprovals.clear(session: event.sessionID)
+            recent.removeAll { $0.sessionID == event.sessionID && $0.requiresAction }
+            overlays.clear(session: event.sessionID, preservingCompletions: true)
+        }
+    }
+
+    private func releasePendingApprovals() {
+        guard !overlays.paused, !overlays.locked else { pendingApprovals.clear(); return }
+        for event in pendingApprovals.takeReady(now: ProcessInfo.processInfo.systemUptime) {
+            guard let notice = event.notice, preferences.decision(for: notice).show else { continue }
+            let eventID = String(digest(Data(event.key.utf8)).prefix(12))
+            deliveryLog.info("approval stage=delivered event=\(eventID, privacy: .public)")
+            receive(notice)
         }
     }
 
@@ -252,23 +313,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(screenUnlocked), name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
     }
 
-    private func updateVisibility() { overlays.locked = isScreenLocked || isScreenAsleep || isSessionInactive }
+    private func updateVisibility() {
+        overlays.locked = isScreenLocked || isScreenAsleep || isSessionInactive
+        if overlays.locked { pendingApprovals.clear() }
+    }
     @objc private func screenLocked() { isScreenLocked = true; updateVisibility() }
     @objc private func screenUnlocked() { isScreenLocked = false; updateVisibility() }
     @objc private func quit() { NSApp.terminate(nil) }
-    @objc private func clear() { overlays.clear() }
-    @objc private func togglePause() { overlays.paused.toggle(); updateBadge() }
+    @objc private func clear() { pendingApprovals.clear(); overlays.clear() }
+    @objc private func togglePause() {
+        overlays.paused.toggle()
+        if overlays.paused { pendingApprovals.clear() }
+        updateBadge()
+    }
     @objc private func togglePrivacy() {
         overlays.hideBody.toggle(); UserDefaults.standard.set(overlays.hideBody, forKey: "hideBody")
     }
     @objc private func replay(_ sender: NSMenuItem) {
-        if let notice = sender.representedObject as? Notice { overlays.show(notice, retention: preferences.decision(for: notice).retention) }
+        if let notice = sender.representedObject as? Notice {
+            let decision = preferences.decision(for: notice)
+            if decision.show { overlays.show(notice, retention: decision.retention) }
+        }
     }
     @objc func demo() {
-        receive(Notice(source: "Notification", title: "每一块屏幕，都能看见", body: "通知会同步显示在所有屏幕上方，不打断当前输入。"))
+        overlays.show(Notice(source: "Notification", title: "每一块屏幕，都能看见", body: "通知会同步显示在所有屏幕上方，不打断当前输入。"))
     }
     @objc private func demoHITL() {
-        receive(Notice(source: "Codex CLI · 演示", title: "待审批", body: "这是菜单栏生成的测试提醒。", kind: .approval))
+        receive(Notice(source: "Codex CLI", title: "审批请求", body: "这是菜单栏生成的测试提醒。", kind: .approval))
     }
 
     @objc private func testSystemNotification() {
@@ -291,7 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 self.updateBadge()
                 let content = UNMutableNotificationContent()
                 content.title = self.systemTestTitle!
-                content.body = "这条消息由 macOS 通知中心投递，再由 Notification 读取并展示。"
+                content.body = "这条消息用于测量系统接收通道，不进入浮层或最近提醒。"
                 center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil)) { error in
                     if let error {
                         DispatchQueue.main.async { self.systemTestStatus = "系统测试：\(error.localizedDescription)"; self.updateBadge() }
@@ -328,7 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         health.font = .systemFont(ofSize: 12); health.textColor = .secondaryLabelColor
         stack.addArrangedSubview(health); healthLabel = health
         stack.addArrangedSubview(NSButton(title: "通知策略与过滤规则…", target: self, action: #selector(showPreferences)))
-        let copy = NSTextField(wrappingLabelWithString: "1. 即时接收系统横幅\n为 Notification 开启辅助功能，并保留来源应用的系统横幅。横幅出现时即可读取；关闭横幅后，此通道无法接收。\n\n2. 系统通知补漏\n开启完全磁盘访问后退出并重开本应用。未捕获的通知从数据库补收，macOS 可能延后数秒保存。\n\n3. 接收 Codex 人工介入提醒\n按仓库说明安装并信任 hooks，审批和回答仍在 Codex 中完成。\n\n普通通知仅提供「打开应用」。不自动点击或关闭原通知，不重放启动前的历史通知。")
+        let copy = NSTextField(wrappingLabelWithString: "1. 选择通知范围\n飞书、Codex 和其他应用均可在通知策略中设置。其他应用默认不通知。为 Notification 开启辅助功能，并保留来源应用的系统横幅。横幅出现时即可读取；关闭横幅后，此通道无法接收。\n\n2. 系统通知补漏\n开启完全磁盘访问后退出并重开本应用。未捕获的通知从数据库补收，macOS 可能延后数秒保存。\n\n3. 接收 Codex 提醒\n按仓库说明安装并信任 hooks。审批与提问、任务完成分别设置；完成通知默认关闭，可按多个目录过滤。审批和回答仍在 Codex 中完成。\n\n通知提供「Go」打开来源、「Go & Close」打开成功后关闭此提醒。不自动点击或关闭原通知，不重放启动前的历史通知。")
         copy.font = .systemFont(ofSize: 13); copy.preferredMaxLayoutWidth = 490; stack.addArrangedSubview(copy)
         let permissions = NSButton(title: "打开完全磁盘访问设置", target: self, action: #selector(openPermissions))
         stack.addArrangedSubview(permissions)

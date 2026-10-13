@@ -1,7 +1,7 @@
 import Foundation
 
 public struct HookEvent: Codable {
-    public enum Action: String, Codable { case show, resolve, clearSession }
+    public enum Action: String, Codable { case show, resolve, clearSession, complete, endSession }
     public var action: Action
     public var key: String
     public var sessionID: String
@@ -18,10 +18,31 @@ public enum CodexHook {
         let tool = root["tool_name"] as? String ?? ""
         let input = root["tool_input"] as? [String: Any] ?? [:]
         let turn = root["turn_id"] as? String ?? ""
-        let encoded = (try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys])) ?? Data()
+        // Bash approval adds description, but PostToolUse carries only command.
+        // Correlate that supported tool by its command, without persisting the command.
+        // Other tools retain their arguments: description can be a real MCP input.
+        let identityInput: [String: Any]
+        if tool == "Bash", let command = input["command"] as? String {
+            identityInput = ["command": command]
+        } else { identityInput = input }
+        let encoded = (try? JSONSerialization.data(withJSONObject: identityInput, options: [.sortedKeys])) ?? Data()
         let inputKey = digest(encoded)
         let key = "codex:\(session):\(turn):\(tool):\(inputKey)"
-        if ["Stop", "Interrupt", "SessionEnd", "UserPromptSubmit"].contains(event) {
+        if event == "Stop" {
+            // Stop reports a finished response, not acceptance of the project's task or successful tests.
+            // Deliberately do not persist last_assistant_message or read the transcript.
+            let directory = ProjectContext.directoryURL(root["cwd"] as? String)?.path
+            let completionKey = "codex:\(session):\(turn.isEmpty ? UUID().uuidString : turn):complete"
+            let notice = Notice(id: completionKey, source: "Codex CLI", title: "任务完成",
+                                body: "本轮回复已结束，可回到 Codex 查看结果。", kind: .completion,
+                                createdAt: now, sessionID: session, context: ProjectContext.label(for: directory),
+                                workingDirectory: directory)
+            return HookEvent(action: .complete, key: completionKey, sessionID: session, createdAt: now, notice: notice)
+        }
+        if event == "SessionEnd" {
+            return HookEvent(action: .endSession, key: key, sessionID: session, createdAt: now)
+        }
+        if ["Interrupt", "UserPromptSubmit"].contains(event) {
             return HookEvent(action: .clearSession, key: key, sessionID: session, createdAt: now)
         }
         if event == "PostToolUse" {
@@ -37,9 +58,10 @@ public enum CodexHook {
         let context = ProjectContext.label(for: root["cwd"] as? String)
         let questions = input["questions"] as? [[String: Any]] ?? []
         // Never persist commands, raw tool arguments, tokens, or full transcripts.
-        let body = kind == .approval ? (input["justification"] as? String ?? tool.split(separator: ".").last.map(String.init) ?? "")
+        let body = kind == .approval ? (input["description"] as? String ?? input["justification"] as? String ?? tool.split(separator: ".").last.map(String.init) ?? "")
             : questions.compactMap { $0["question"] as? String ?? $0["title"] as? String }.joined(separator: "\n")
-        let notice = Notice(id: key, source: "Codex CLI", title: kind == .approval ? "待审批" : "待回答",
+        // A request may be decided by automatic review; it does not prove a human is waiting.
+        let notice = Notice(id: key, source: "Codex CLI", title: kind == .approval ? "审批请求" : "待回答",
                             body: String(body.prefix(1000)), kind: kind, createdAt: now,
                             sessionID: session, context: context)
         return HookEvent(action: .show, key: key, sessionID: session, createdAt: now, notice: notice)
