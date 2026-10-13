@@ -2,7 +2,8 @@ import Foundation
 import CryptoKit
 
 public struct Notice: Codable, Equatable, Identifiable {
-    public enum Kind: String, Codable { case notification, approval, input }
+    public enum Kind: String, Codable { case notification, approval, input, completion }
+    public enum CodexClient: String, Codable { case desktop, cli }
     public var id: String
     public var source: String
     public var title: String
@@ -14,16 +15,25 @@ public struct Notice: Codable, Equatable, Identifiable {
     public var context: String?
     public var tmux: TmuxContext?
     public var notificationIdentifier: String?
-    public var requiresAction: Bool { kind != .notification }
+    public var workingDirectory: String?
+    public var codexClient: CodexClient?
+    public var resumeCommand: String?
+    // Copying a recovery command is a fallback, not a direct task navigation target.
+    public var hasCodexDestination: Bool { codexClient == .desktop || tmux != nil }
+    public var requiresAction: Bool { kind == .approval || kind == .input }
 
     public init(id: String = UUID().uuidString, source: String, title: String, body: String,
                 kind: Kind = .notification, createdAt: Date = Date(), bundleID: String? = nil,
                 sessionID: String? = nil, context: String? = nil, tmux: TmuxContext? = nil,
-                notificationIdentifier: String? = nil) {
+                notificationIdentifier: String? = nil, workingDirectory: String? = nil, codexClient: CodexClient? = nil,
+                resumeCommand: String? = nil) {
         self.id = id; self.source = source; self.title = title; self.body = body
         self.kind = kind; self.createdAt = createdAt; self.bundleID = bundleID
         self.sessionID = sessionID; self.context = context; self.tmux = tmux
         self.notificationIdentifier = notificationIdentifier
+        self.workingDirectory = workingDirectory
+        self.codexClient = codexClient
+        self.resumeCommand = resumeCommand
     }
 }
 

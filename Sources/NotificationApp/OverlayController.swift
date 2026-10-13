@@ -20,7 +20,9 @@ final class OverlayController {
             Notice(source: "Notification", title: "构建已完成", body: "新的应用版本已就绪。", bundleID: "me.leiguoguo.notification"),
             Notice(source: "Codex CLI", title: "待回答", body: "这次构建要使用哪一个目标环境？", kind: .input,
                    context: "tool/notification", tmux: TmuxContext(socketPath: "/tmp/notification-preview", serverPID: 1,
-                   sessionID: "$1", windowID: "@1", paneID: "%1", sessionName: "dev", windowName: "notification", paneIndex: 2))
+                   sessionID: "$1", windowID: "@1", paneID: "%1", sessionName: "dev", windowName: "notification", paneIndex: 2)),
+            Notice(source: "Codex 桌面端", title: "审批请求", body: "发布已通过检查的备份。", kind: .approval,
+                   sessionID: "01a00000-0000-7000-8000-000000000001", context: "routine/AutoBackup", codexClient: .desktop)
         ]
         let padding: CGFloat = 24
         let width = preferredWidth - horizontalInset * 2 + padding * 2
@@ -75,13 +77,15 @@ final class OverlayController {
 
     func show(_ notice: Notice, retention: RetentionPolicy? = nil) {
         guard !paused, !locked else { return }
+        let policy = retention ?? RetentionPolicy(mode: notice.requiresAction ? .untilHandled : .timed)
+        guard policy.isEnabled else { return }
         guard !active.contains(where: { $0.notice.id == notice.id }), !waiting.contains(where: { $0.notice.id == notice.id }) else { return }
         if waiting.count >= 100 {
             if let index = waiting.firstIndex(where: { $0.retention.duration != nil }) { waiting.remove(at: index) }
             else { waiting.removeFirst() }
             dropped += 1
         }
-        let item = Pending(notice: notice, retention: retention ?? RetentionPolicy(mode: notice.requiresAction ? .untilHandled : .timed))
+        let item = Pending(notice: notice, retention: policy)
         if notice.requiresAction { waiting.insert(item, at: 0) } else { waiting.append(item) }
         fill(); render(); onChange?()
     }
@@ -97,10 +101,13 @@ final class OverlayController {
         active[index].deadline = inProgress ? nil : active[index].duration.map { Date().addingTimeInterval($0) }
     }
 
-    func clear(session: String? = nil) {
+    func clear(session: String? = nil, preservingCompletions: Bool = false) {
         if let session {
-            guard active.contains(where: { $0.notice.sessionID == session }) || waiting.contains(where: { $0.notice.sessionID == session }) else { return }
-            active.removeAll { $0.notice.sessionID == session }; waiting.removeAll { $0.notice.sessionID == session }
+            func matches(_ notice: Notice) -> Bool {
+                notice.sessionID == session && (!preservingCompletions || notice.kind != .completion)
+            }
+            guard active.contains(where: { matches($0.notice) }) || waiting.contains(where: { matches($0.notice) }) else { return }
+            active.removeAll { matches($0.notice) }; waiting.removeAll { matches($0.notice) }
         } else { active = []; waiting = [] }
         fill(); render(); onChange?()
     }
@@ -171,10 +178,16 @@ private struct NoticeCard: View {
     let hideBody: Bool
     let dismiss: () -> Void
     var onActionStateChange: (Bool) -> Void = { _ in }
-    @ViewState private var isOpeningTmux = false
-    @ViewState private var isOpeningApplication = false
+    @ViewState private var isOpening = false
     @ViewState private var navigationError: String?
-    private var accent: Color { notice.requiresAction ? Color(red: 0.98, green: 0.70, blue: 0.26) : Color(red: 0.36, green: 0.86, blue: 0.78) }
+    private var accent: Color { notice.requiresAction ? Color(red: 0.68, green: 0.25, blue: 0.015) : Color(red: 0.045, green: 0.28, blue: 0.70) }
+    private let ink = Color(red: 0.10, green: 0.14, blue: 0.20)
+    private var background: LinearGradient {
+        LinearGradient(colors: notice.requiresAction
+            ? [Color(red: 1, green: 0.91, blue: 0.60), Color(red: 1, green: 0.97, blue: 0.86)]
+            : [Color(red: 0.82, green: 0.92, blue: 1), Color(red: 0.95, green: 0.98, blue: 1)],
+            startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -186,26 +199,28 @@ private struct NoticeCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Image(systemName: notice.requiresAction ? "hand.raised.fill" : "bell.badge.fill").foregroundStyle(accent)
+                Image(systemName: notice.requiresAction ? "hand.raised.fill" : "bell.badge.fill")
+                    .font(.system(size: 19, weight: .bold)).foregroundStyle(.white)
+                    .frame(width: 40, height: 40).background(accent, in: RoundedRectangle(cornerRadius: 11))
                 Text(!hideBody ? notice.context ?? notice.source : notice.source)
-                    .lineLimit(1).truncationMode(.middle).font(.system(size: notice.context == nil || hideBody ? 12 : 17, weight: .semibold))
+                    .lineLimit(1).truncationMode(.middle).font(.system(size: notice.context == nil || hideBody ? 14 : 18, weight: .bold))
                 if notice.context != nil && !hideBody {
-                    Text(notice.source).lineLimit(1).foregroundStyle(.white.opacity(0.55)).font(.system(size: 11))
+                    Text(notice.source).lineLimit(1).foregroundStyle(ink.opacity(0.75)).font(.system(size: 12, weight: .medium))
                 }
-                if let tmux = notice.tmux, !hideBody {
+                if let tmux = notice.tmux, notice.codexClient != .desktop, !hideBody {
                     Label(tmux.label, systemImage: "terminal")
-                        .font(.system(size: 12, design: .monospaced)).foregroundStyle(.white.opacity(0.65))
+                        .font(.system(size: 13, design: .monospaced)).foregroundStyle(ink.opacity(0.80))
                         .lineLimit(1).truncationMode(.middle).layoutPriority(1)
                 }
                 Spacer(minLength: 4)
                 Text(Self.timeFormatter.string(from: notice.createdAt))
-                    .font(.system(size: 12)).monospacedDigit().foregroundStyle(.white.opacity(0.65))
+                    .font(.system(size: 13, weight: .medium)).monospacedDigit().foregroundStyle(ink.opacity(0.75))
                     .fixedSize().help("通知时间：" + notice.createdAt.formatted(date: .numeric, time: .standard))
                     .accessibilityLabel("通知时间 " + Self.timeFormatter.string(from: notice.createdAt))
                 if notice.requiresAction {
-                    Text(notice.title).font(.system(size: 12, weight: .medium)).foregroundStyle(accent)
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                        .background(accent.opacity(0.13), in: Capsule()).fixedSize()
+                    Text(notice.title).font(.system(size: 13, weight: .bold)).foregroundStyle(.white)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(accent, in: Capsule()).fixedSize()
                 }
                 actions.fixedSize()
                 Button(action: dismiss) { Image(systemName: "xmark").font(.system(size: 13, weight: .semibold)) }
@@ -213,55 +228,79 @@ private struct NoticeCard: View {
                     .accessibilityLabel("关闭提醒")
             }
             if !notice.requiresAction {
-                Text(hideBody ? "收到一条新提醒" : notice.title).font(.system(size: 19, weight: .bold)).lineLimit(1)
+                Text(hideBody ? "收到一条新提醒" : notice.title).font(.system(size: 21, weight: .bold)).lineLimit(1)
             }
             if let error = navigationError {
-                Text(error).font(.system(size: 11)).foregroundStyle(accent).lineLimit(1).help(error)
+                Text(error).font(.system(size: 13, weight: .semibold)).foregroundStyle(accent).lineLimit(1).help(error)
             } else if hideBody || !notice.body.isEmpty {
-                Text(hideBody ? "内容已隐藏" : notice.body).font(.system(size: notice.requiresAction ? 15 : 13))
-                    .foregroundStyle(.white.opacity(0.85)).lineLimit(notice.requiresAction ? 5 : 3)
+                Text(hideBody ? "内容已隐藏" : notice.body).font(.system(size: notice.requiresAction ? 17 : 16, weight: .medium))
+                    .foregroundStyle(ink.opacity(0.90)).lineLimit(notice.requiresAction ? 3 : 2)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .padding(16).frame(maxWidth: .infinity, alignment: .topLeading)
-        .foregroundStyle(.white)
-        .background(Color(red: 0.045, green: 0.09, blue: 0.12).opacity(0.97), in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(accent.opacity(0.7), lineWidth: 1.2))
-        .overlay(alignment: .leading) { Capsule().fill(accent).frame(width: 3, height: 44).padding(.leading, 1) }
+        .foregroundStyle(ink)
+        .background(background, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(alignment: .leading) { Rectangle().fill(accent).frame(width: 6) }
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(accent.opacity(0.85), lineWidth: 2))
+        .shadow(color: .black.opacity(0.22), radius: 6, x: 0, y: 3)
     }
 
     private var actions: some View {
         HStack(spacing: 10) {
-            if let tmux = notice.tmux {
-                Button {
-                    isOpeningTmux = true; navigationError = nil
-                    TmuxNavigator.open(tmux) { error in isOpeningTmux = false; navigationError = error }
-                } label: {
-                    Label(isOpeningTmux ? "定位中…" : "打开 tmux", systemImage: "arrow.up.right.square")
-                }.disabled(isOpeningTmux)
+            if notice.codexClient == .desktop {
+                openButtons(target: "Codex 桌面端", systemImage: "app") { completion in
+                    CodexDesktopNavigator.open(sessionID: notice.sessionID, completion: completion)
+                }
+            } else if let tmux = notice.tmux {
+                openButtons(target: "tmux", systemImage: "arrow.up.right.square") { completion in
+                    TmuxNavigator.open(tmux, completion: completion)
+                }
             }
-            if notice.tmux == nil || navigationError != nil {
-                if let session = notice.sessionID, UUID(uuidString: session) != nil {
+            if notice.codexClient != .desktop && (notice.tmux == nil || navigationError != nil) {
+                if let command = notice.resumeCommand {
                     Button {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString("codex resume \(session)", forType: .string)
+                        NSPasteboard.general.setString(command, forType: .string)
                     } label: { Label("复制恢复命令", systemImage: "doc.on.doc") }
                 } else if let bundle = notice.bundleID, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
-                    Button {
-                        isOpeningApplication = true; navigationError = nil; onActionStateChange(true)
+                    openButtons(target: notice.source, systemImage: "app") { completion in
                         NSWorkspace.shared.openApplication(at: url, configuration: .init()) { _, error in
                             DispatchQueue.main.async {
-                                isOpeningApplication = false; onActionStateChange(false)
-                                navigationError = error.map { "无法打开应用：\($0.localizedDescription)" }
-                                if error == nil { dismiss() }
+                                completion(error.map { "无法打开应用：\($0.localizedDescription)" })
                             }
                         }
-                    } label: { Label("打开应用", systemImage: "app") }
-                    .disabled(isOpeningApplication)
+                    }
                 }
             }
         }
-        .buttonStyle(NoticeActionStyle()).font(.system(size: 12, weight: .semibold))
+        .buttonStyle(NoticeActionStyle(tint: accent)).font(.system(size: 13, weight: .bold))
+    }
+
+    private func openButtons(target: String, systemImage: String,
+                             open: @escaping (@escaping (String?) -> Void) -> Void) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                navigate(closeOnSuccess: false, open: open)
+            } label: { Label("Go", systemImage: systemImage) }
+            .help("打开\(target)，保留此提醒")
+            Button {
+                navigate(closeOnSuccess: true, open: open)
+            } label: { Label("Go & Close", systemImage: systemImage) }
+            .buttonStyle(NoticeActionStyle(tint: accent, prominent: true))
+            .help("打开\(target)，成功后在所有屏幕关闭此提醒")
+        }
+        .disabled(isOpening)
+    }
+
+    private func navigate(closeOnSuccess: Bool, open: (@escaping (String?) -> Void) -> Void) {
+        guard !isOpening else { return }
+        isOpening = true; navigationError = nil; onActionStateChange(true)
+        open { error in
+            isOpening = false; onActionStateChange(false); navigationError = error
+            if closeOnSuccess && error == nil { dismiss() }
+        }
     }
 }
 
@@ -271,8 +310,9 @@ private struct NoticeDismissStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .frame(width: 40, height: 40)
-            .background(.white.opacity(configuration.isPressed ? 0.24 : (isHovered ? 0.16 : 0.07)),
+            .background(.black.opacity(configuration.isPressed ? 0.18 : (isHovered ? 0.12 : 0.06)),
                         in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.black.opacity(0.16), lineWidth: 1))
             // Include the space around the symbol in hit testing, including the corners.
             .contentShape(Rectangle())
             .onHover { isHovered = $0 }
@@ -280,13 +320,21 @@ private struct NoticeDismissStyle: ButtonStyle {
 }
 
 private struct NoticeActionStyle: ButtonStyle {
+    var tint: Color
+    var prominent = false
+    @Environment(\.isEnabled) private var isEnabled
+    @ViewState private var isHovered = false
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundStyle(.white)
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(Color(red: 0.17, green: 0.31, blue: 0.44).opacity(configuration.isPressed ? 0.65 : 1),
-                        in: RoundedRectangle(cornerRadius: 7))
-            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.white.opacity(0.28), lineWidth: 1))
-            .contentShape(RoundedRectangle(cornerRadius: 7))
+            .foregroundStyle(prominent ? .white : tint)
+            .padding(.horizontal, 12).frame(height: 36)
+            .background(prominent ? tint : Color.white.opacity(isHovered ? 0.95 : 0.65),
+                        in: RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(tint, lineWidth: 1.5))
+            .overlay(RoundedRectangle(cornerRadius: 9).fill(.black.opacity(configuration.isPressed ? 0.16 : (prominent && isHovered ? 0.08 : 0))))
+            .opacity(isEnabled ? 1 : 0.45)
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+            .onHover { isHovered = $0 }
     }
 }

@@ -18,8 +18,9 @@ struct PreferencesView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("通知策略与过滤规则").font(.title2.bold())
+            Text("分别设置是否通知、停留时间及过滤范围。").font(.caption).foregroundStyle(.secondary)
             TabView {
-                retentionPage.tabItem { Text("停留策略") }
+                retentionPage.tabItem { Text("通知策略") }
                 filterPage.tabItem { Text("飞书消息过滤") }
                 recognitionPage.tabItem { Text("文字识别") }
                 previewPage.tabItem { Text("规则试算") }
@@ -44,8 +45,23 @@ struct PreferencesView: View {
     private var retentionPage: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                GroupBox("Codex 人工介入提醒") {
-                    RetentionRow(title: "审批与提问", policy: $draft.codex).padding(10)
+                GroupBox("Codex CLI") {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Toggle("tmux 在前台时，不通知当前 session/window 内的 pane", isOn: $draft.suppressForegroundTmuxWindow)
+                        Text("适用于该窗口内所有 pane 的审批、提问和完成提醒。需要 tmux 开启 focus-events 且终端支持焦点上报；无法确认前台窗口时仍通知。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        RetentionRow(title: "审批与提问", policy: $draft.codex)
+                        Divider()
+                        RetentionRow(title: "任务完成", policy: $draft.codexCompletion.retention)
+                        completionFilters
+                    }.padding(10)
+                }
+                GroupBox("Codex桌面端") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        RetentionRow(title: "所有通知", policy: $draft.codexDesktop)
+                        Text("审批、提问、任务完成和桌面端系统通知统一使用此策略，独立于终端设置。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }.padding(10)
                 }
                 GroupBox("飞书通知") {
                     VStack(spacing: 16) {
@@ -54,11 +70,42 @@ struct PreferencesView: View {
                         RetentionRow(title: "其他", policy: $draft.feishu.other)
                     }.padding(10)
                 }
-                Text("计时从浮层真正显示时开始。选择等待处理时，Codex 会在任务继续或相应操作完成后清除；飞书需关闭卡片或点击打开应用。")
+                GroupBox("其他应用") {
+                    RetentionRow(title: "系统通知", policy: $draft.otherApps).padding(10)
+                }
+                Text("选择「不通知」后，不显示浮层，也不加入队列或最近提醒。Codex桌面端、其他应用和终端任务完成默认不通知，启用并保存后生效。")
                     .font(.callout).foregroundStyle(.secondary)
-                Text("飞书类型按通知标题和正文的关键词识别，可在「文字识别」中调整。其他应用仍显示 10 秒。")
+                Text("计时从浮层真正显示时开始。「等待处理」持续显示：Codex 在会话继续或相应操作完成后清除；其他提醒需关闭卡片或打开来源应用。飞书类型可在「文字识别」中调整。")
                     .font(.callout).foregroundStyle(.secondary)
             }.padding(18)
+        }
+    }
+
+    private var completionFilters: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("完成通知表示本轮回复结束，可返回 Codex 查看结果。").font(.caption).foregroundStyle(.secondary)
+            Toggle("仅通知以下目录及其子目录", isOn: $draft.codexCompletion.filterDirectories)
+            if draft.codexCompletion.filterDirectories {
+                ForEach($draft.codexCompletion.directories) { $directory in
+                    HStack(spacing: 10) {
+                        Toggle("启用目录", isOn: $directory.enabled).labelsHidden().help("启用这个目录")
+                        TextField("例如 ~/codex-path/learning", text: $directory.path)
+                            .textFieldStyle(.roundedBorder).accessibilityLabel("完成通知目录")
+                        Button("删除") {
+                            let id = directory.id
+                            draft.codexCompletion.directories.removeAll { $0.id == id }
+                        }
+                    }
+                }
+                Button { draft.codexCompletion.directories.append(CompletionDirectory()) } label: {
+                    Label("添加目录", systemImage: "plus")
+                }
+                Text("命中任一启用目录即可通知。例如 ~/codex-path/learning 包含其下所有项目；learning-other 不会命中。支持绝对路径及 ~/，可添加多个目录。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("未开启目录过滤：启用任务完成通知后，适用于所有已接入的项目。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -91,7 +138,7 @@ struct PreferencesView: View {
                     }
                 }
                 Button { draft.feishu.conditions.append(MessageCondition()) } label: { Label("添加条件", systemImage: "plus") }
-                Text("可添加多条内容关键词条件，例如「发布」或「故障」。关闭过滤时，所有飞书消息均显示；日历和其他通知不受这里的消息过滤影响。")
+                Text("可添加多条内容关键词条件，例如「发布」或「故障」。关闭过滤时，不按消息内容筛选；是否通知仍由「通知策略」决定。日历和其他通知不受这里的消息过滤影响。")
                     .font(.callout).foregroundStyle(.secondary)
                 Text("@我和加急使用通知文字匹配，无法保证等同于飞书内部属性。可在「文字识别」中补充自己的 @姓名，并用「规则试算」核对效果。")
                     .font(.callout).foregroundStyle(.secondary)
@@ -128,7 +175,7 @@ struct PreferencesView: View {
                 GroupBox("试算结果") {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("分类：\(decision.feishuType?.title ?? "其他应用")")
-                        Text(decision.show ? "结果：显示浮层" : "结果：不显示（消息过滤未通过）")
+                        Text(decision.show ? "结果：显示浮层" : (decision.retention.isEnabled ? "结果：不通知（消息过滤未通过）" : "结果：不通知（已关闭此类通知）"))
                             .fontWeight(.semibold)
                         if decision.show {
                             Text(decision.retention.mode == .untilHandled ? "停留：一直显示，等待处理" : "停留：\(decision.retention.seconds) 秒后消失")
@@ -146,10 +193,11 @@ private struct RetentionRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Text(title).frame(width: 100, alignment: .leading)
-            Picker("停留策略", selection: $policy.mode) {
+            Picker("通知策略", selection: $policy.mode) {
+                Text("不通知").tag(RetentionPolicy.Mode.disabled)
                 Text("定时消失").tag(RetentionPolicy.Mode.timed)
                 Text("等待处理").tag(RetentionPolicy.Mode.untilHandled)
-            }.labelsHidden().frame(width: 160)
+            }.labelsHidden().frame(width: 160).accessibilityLabel(title + "通知策略")
             if policy.mode == .timed {
                 TextField("秒数", value: $policy.seconds, format: .number).frame(width: 70)
                 Text("秒").foregroundStyle(.secondary)

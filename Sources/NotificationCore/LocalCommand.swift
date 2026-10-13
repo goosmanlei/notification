@@ -3,10 +3,12 @@ import Darwin
 
 /// Bounded, argument-based local commands. A slow tmux server must not hold up a Codex hook.
 public enum LocalCommand {
-    public static func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval = 0.5) -> String? {
+    public static func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval = 0.5,
+                           environment: [String: String]? = nil) -> String? {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = executable; process.arguments = arguments
+        if let environment { process.environment = environment }
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = pipe; process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return nil }

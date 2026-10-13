@@ -4,6 +4,8 @@ import CSQLite
 import NotificationCore
 
 final class NotificationCoreTests {
+    private let codexTmux = TmuxContext(socketPath: "/tmp/test.sock", serverPID: 1, sessionID: "$1", windowID: "@1",
+                                        paneID: "%1", sessionName: "test", windowName: "test", paneIndex: 0)
     private func payload(title: String = "Test", body: String = "hello", response: Int = 0) throws -> Data {
         try PropertyListSerialization.data(fromPropertyList: [
             "app": "com.example.test", "date": 123.0, "resp": ["act": response],
@@ -150,6 +152,8 @@ final class NotificationCoreTests {
         feishu["meeting"] = ["mode": "timed", "seconds": 9999]
         feishu["meetingKeywords"] = "旧会议规则"
         legacy["feishu"] = feishu
+        legacy.removeValue(forKey: "codexCompletion")
+        legacy.removeValue(forKey: "otherApps")
         defaults.set(try JSONSerialization.data(withJSONObject: legacy), forKey: NotificationPreferences.defaultsKey)
         checkEqual(NotificationPreferences.load(from: defaults), preferences)
         checkEqual(preferences.decision(for: codex).retention.duration, 7)
@@ -188,7 +192,8 @@ final class NotificationCoreTests {
         checkEqual(preferences.decision(for: notice).feishuType, .calendar)
         notice.bundleID = "example.other"
         checkNil(preferences.decision(for: notice).feishuType)
-        checkEqual(preferences.decision(for: notice).retention.duration, 10)
+        checkFalse(preferences.decision(for: notice).show)
+        checkEqual(preferences.decision(for: notice).retention.mode, .disabled)
     }
 
     func testFeishuMessageFiltersAndClassificationBoundary() {
@@ -212,7 +217,7 @@ final class NotificationCoreTests {
         notice.body = "日程提醒：下午三点"
         checkTrue(preferences.decision(for: notice).show) // Message filters never suppress a calendar notice.
         notice.body = "ordinary"; notice.bundleID = "example.other"
-        checkTrue(preferences.decision(for: notice).show)
+        checkFalse(preferences.decision(for: notice).show)
         notice.bundleID = "com.electron.lark"
         preferences.feishu.conditions = [.init(keyword: "   ")]
         checkFalse(preferences.decision(for: notice).show)
@@ -235,6 +240,184 @@ final class NotificationCoreTests {
         checkFalse(preferences.decision(for: notice).show)
     }
 
+    func testOnlyConfiguredApplicationsAreAllowed() {
+        var preferences = NotificationPreferences()
+        preferences.codex = RetentionPolicy(seconds: 17)
+        for bundleID in ["com.electron.lark", "com.bytedance.lark", "com.larksuite.lark"] {
+            let notice = Notice(source: "飞书", title: "通知", body: "内容", bundleID: bundleID)
+            checkTrue(preferences.acceptsSource(notice))
+            checkTrue(preferences.decision(for: notice).show)
+        }
+        for kind in [Notice.Kind.approval, .input] {
+            let notice = Notice(source: "Codex CLI", title: "提醒", body: "内容", kind: kind, tmux: codexTmux)
+            checkTrue(preferences.acceptsSource(notice))
+            checkTrue(preferences.decision(for: notice).show)
+            checkEqual(preferences.decision(for: notice).retention.duration, 17)
+        }
+        for source in ["Safari", "Mail", "Notification", "未知应用", "飞书", "Codex CLI"] {
+            for kind in [Notice.Kind.notification, .approval, .input] {
+                let notice = Notice(source: source, title: "@你 ⚡加急⚡", body: "日历助手", kind: kind, bundleID: "example.other")
+                checkFalse(preferences.acceptsSource(notice))
+                checkFalse(preferences.decision(for: notice).show)
+                preferences.otherApps = RetentionPolicy(seconds: 23)
+                checkTrue(preferences.acceptsSource(notice))
+                checkTrue(preferences.decision(for: notice).show)
+                checkEqual(preferences.decision(for: notice).retention.duration, 23)
+                checkNil(preferences.decision(for: notice).feishuType)
+                preferences.otherApps.mode = .disabled
+            }
+        }
+        checkFalse(preferences.decision(for: Notice(source: "未知应用", title: "提醒", body: "内容", kind: .approval)).show)
+        checkFalse(preferences.decision(for: Notice(source: "Codex CLI", title: "提醒", body: "内容")).show)
+        checkTrue(preferences.decision(for: Notice(source: "飞书", title: "提醒", body: "内容")).show)
+        preferences.feishu.filterMessages = true
+        preferences.feishu.conditions = [.init(keyword: "发布")]
+        let filtered = Notice(source: "飞书", title: "提醒", body: "内容", bundleID: "com.electron.lark")
+        checkTrue(preferences.acceptsSource(filtered))
+        checkFalse(preferences.decision(for: filtered).show)
+    }
+
+    func testDisabledPoliciesOverrideFiltersAndPersistIndependently() throws {
+        let name = "notification-tests-" + UUID().uuidString
+        let defaults = try unwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        var preferences = NotificationPreferences()
+        let completed = Notice(source: "Codex CLI", title: "任务完成", body: "", kind: .completion)
+        checkFalse(completed.requiresAction)
+        checkFalse(preferences.decision(for: completed).show)
+        checkEqual(preferences.otherApps.mode, .disabled)
+        let codex = Notice(source: "Codex CLI", title: "待回答", body: "", kind: .input)
+        let message = Notice(source: "飞书", title: "项目群", body: "@你", bundleID: "com.electron.lark")
+        let calendar = Notice(source: "飞书", title: "日历助手", body: "", bundleID: "com.electron.lark")
+        let other = Notice(source: "飞书", title: "任务助手", body: "", bundleID: "com.electron.lark")
+        preferences.codex.mode = .disabled
+        checkFalse(preferences.decision(for: codex).show)
+        checkTrue(preferences.decision(for: message).show)
+        preferences.feishu.message.mode = .disabled
+        checkFalse(preferences.decision(for: message).show)
+        checkTrue(preferences.decision(for: calendar).show)
+        preferences.feishu.calendar.mode = .disabled
+        checkFalse(preferences.decision(for: calendar).show)
+        checkTrue(preferences.decision(for: other).show)
+        preferences.feishu.other.mode = .disabled
+        checkFalse(preferences.decision(for: other).show)
+        // Incomplete inactive rules must never stop the user from turning a category off.
+        preferences.feishu.filterMessages = true
+        preferences.codexCompletion.filterDirectories = true
+        checkNil(preferences.validationError)
+        preferences.codexCompletion.retention = RetentionPolicy(seconds: 8)
+        checkNotEqual(preferences.validationError, nil)
+        preferences.codexCompletion.directories = [.init(path: "~/codex-path/learning")]
+        preferences.otherApps = RetentionPolicy(mode: .untilHandled)
+        try preferences.save(to: defaults)
+        checkEqual(NotificationPreferences.load(from: defaults), preferences)
+        preferences.otherApps = RetentionPolicy(seconds: 3601)
+        checkThrows(try preferences.save(to: defaults))
+        preferences.otherApps.mode = .disabled
+        preferences.codexCompletion.retention.seconds = 0
+        checkThrows(try preferences.save(to: defaults))
+        preferences.codexCompletion.retention.mode = .disabled
+        checkNil(preferences.validationError)
+    }
+
+    func testForegroundTmuxPreferenceAndLegacySettings() throws {
+        let name = "notification-foreground-tests-" + UUID().uuidString
+        let defaults = try unwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        var preferences = try JSONDecoder().decode(NotificationPreferences.self, from: Data("{}".utf8))
+        checkFalse(preferences.suppressForegroundTmuxWindow)
+        preferences.codexDesktop.mode = .untilHandled
+        preferences.codexCompletion.retention.mode = .untilHandled
+        let context = TmuxContext(socketPath: "/tmp/test.sock", serverPID: 1, sessionID: "$1", windowID: "@1",
+                                  paneID: "%1", sessionName: "session", windowName: "window", paneIndex: 1)
+        for kind in [Notice.Kind.approval, .input, .completion] {
+            var notice = Notice(source: "Codex CLI", title: "提醒", body: "", kind: kind, tmux: context)
+            checkTrue(preferences.decision(for: notice, isForegroundTmuxWindow: true).show)
+            preferences.suppressForegroundTmuxWindow = true
+            checkFalse(preferences.decision(for: notice, isForegroundTmuxWindow: true).show)
+            checkTrue(preferences.decision(for: notice, isForegroundTmuxWindow: false).show)
+            notice.tmux = nil
+            checkFalse(preferences.decision(for: notice, isForegroundTmuxWindow: true).show)
+            notice.source = "Codex 桌面端"; notice.codexClient = .desktop; notice.tmux = context
+            checkTrue(preferences.decision(for: notice, isForegroundTmuxWindow: true).show)
+            preferences.suppressForegroundTmuxWindow = false
+        }
+        preferences.suppressForegroundTmuxWindow = true
+        let feishu = Notice(source: "飞书", title: "消息", body: "", bundleID: "com.electron.lark", tmux: context)
+        checkTrue(preferences.decision(for: feishu, isForegroundTmuxWindow: true).show)
+        try preferences.save(to: defaults)
+        checkEqual(NotificationPreferences.load(from: defaults), preferences)
+    }
+
+    func testCompletionDirectoryFiltersRespectBoundariesAndAliases() throws {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        var preferences = NotificationPreferences()
+        preferences.codexCompletion.retention = RetentionPolicy(seconds: 12)
+        var notice = Notice(source: "Codex CLI", title: "任务完成", body: "", kind: .completion, tmux: codexTmux)
+        checkTrue(preferences.decision(for: notice).show) // Explicitly enabled, all projects.
+        preferences.codexCompletion.filterDirectories = true
+        checkFalse(preferences.decision(for: notice).show)
+        preferences.codexCompletion.directories = [.init(path: "~/codex-path/learning/"), .init(path: "/work/Other Project")]
+        for path in [home.appendingPathComponent("codex-path/learning").path,
+                     home.appendingPathComponent("codex-path/learning/A/Sources").path,
+                     "/work/Other Project/nested", "/work/Other Project/./a/../b/"] {
+            notice.workingDirectory = path
+            checkTrue(preferences.decision(for: notice).show)
+        }
+        for path in [home.appendingPathComponent("codex-path/learning-other/A").path,
+                     home.appendingPathComponent("codex-path/learning/../tool/A").path,
+                     "/work/Other Project-extra", "relative/path", "", "/work/Other Project\0bad"] {
+            notice.workingDirectory = path
+            checkFalse(preferences.decision(for: notice).show)
+        }
+        notice.workingDirectory = "/work/Other Project"
+        preferences.codexCompletion.directories[1].enabled = false
+        checkFalse(preferences.decision(for: notice).show)
+        notice.kind = .approval
+        checkTrue(preferences.decision(for: notice).show) // Completion filters do not affect HITL.
+        preferences.codexCompletion.directories = [.init(path: "relative/path")]
+        checkNotEqual(preferences.validationError, nil)
+        preferences.codexCompletion.directories = []
+        checkNotEqual(preferences.validationError, nil)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let target = directory.appendingPathComponent("real/project")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        let alias = directory.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: directory.appendingPathComponent("real"))
+        preferences.codexCompletion.directories = [.init(path: alias.path)]
+        checkTrue(preferences.codexCompletion.allows(target.path))
+        preferences.codexCompletion.directories = [.init(path: directory.appendingPathComponent("real").path)]
+        checkTrue(preferences.codexCompletion.allows(alias.appendingPathComponent("project").path))
+    }
+
+    func testCompletionHookLifecycleAndPayloadMinimization() throws {
+        var payload: [String: Any] = ["hook_event_name": "Stop", "session_id": "session-test", "turn_id": "turn-1",
+                                     "cwd": "/work/project/nested", "last_assistant_message": "private-result", "transcript_path": "/private/transcript"]
+        func event() throws -> HookEvent {
+            try unwrap(CodexHook.parse(JSONSerialization.data(withJSONObject: payload)))
+        }
+        let completion = try event()
+        checkEqual(completion.action, .complete)
+        checkEqual(completion.notice?.kind, .completion)
+        checkEqual(completion.notice?.workingDirectory, "/work/project/nested")
+        checkEqual(completion.key, try event().key)
+        let encoded = String(decoding: try JSONEncoder().encode(completion), as: UTF8.self)
+        checkFalse(encoded.contains("private-result")); checkFalse(encoded.contains("/private/transcript"))
+        payload["turn_id"] = "turn-2"
+        checkNotEqual(completion.key, try event().key)
+        payload["stop_hook_active"] = true // A continued turn may still finish normally.
+        checkEqual(try event().action, .complete)
+        for name in ["Interrupt", "UserPromptSubmit", "SessionEnd"] {
+            payload["hook_event_name"] = name
+            let clear = try event()
+            checkNil(clear.notice)
+            checkEqual(clear.action, name == "SessionEnd" ? .endSession : .clearSession)
+        }
+        payload["hook_event_name"] = "SubagentStop"
+        checkNil(CodexHook.parse(try JSONSerialization.data(withJSONObject: payload)))
+    }
+
     private func hook(_ event: String, tool: String = "Bash", input: [String: Any] = [:]) throws -> Data {
         try JSONSerialization.data(withJSONObject: ["hook_event_name": event, "session_id": "session-test",
             "turn_id": "turn-test", "tool_name": tool, "cwd": "/example/project", "tool_input": input])
@@ -249,7 +432,87 @@ final class NotificationCoreTests {
         checkEqual(show.notice?.context, "project")
         checkFalse(String(decoding: try JSONEncoder().encode(show), as: UTF8.self).contains("secret-value"))
         checkNil(CodexHook.parse(try hook("PreToolUse", tool: "Bash")))
-        checkEqual(CodexHook.parse(try hook("Stop"))?.action, .clearSession)
+        checkEqual(CodexHook.parse(try hook("Stop"))?.action, .complete)
+    }
+
+    func testBashApprovalDescriptionDoesNotBreakResolution() throws {
+        // Real desktop hooks add an approval description only to PermissionRequest.
+        let command = "echo private-value"
+        let show = try unwrap(CodexHook.parse(hook("PermissionRequest", input: [
+            "command": command, "description": "允许运行这项检查吗？"])))
+        let resolve = try unwrap(CodexHook.parse(hook("PostToolUse", input: ["command": command])))
+        checkEqual(show.key, resolve.key)
+        checkEqual(show.notice?.body, "允许运行这项检查吗？")
+        let compatible = try unwrap(CodexHook.parse(hook("PermissionRequest", input: [
+            "command": command, "justification": "旧版审批说明"])))
+        checkEqual(compatible.key, resolve.key)
+        let other = try unwrap(CodexHook.parse(hook("PostToolUse", input: ["command": "echo other"])))
+        checkFalse(other.key == show.key)
+        checkFalse(String(decoding: try JSONEncoder().encode(show), as: UTF8.self).contains("private-value"))
+
+        // MCP description can be a business argument; keep it in the identity.
+        let first = try unwrap(CodexHook.parse(hook("PermissionRequest", tool: "mcp__test__write",
+            input: ["description": "first"])))
+        let second = try unwrap(CodexHook.parse(hook("PostToolUse", tool: "mcp__test__write",
+            input: ["description": "second"])))
+        checkFalse(first.key == second.key)
+    }
+
+    func testDelayedDesktopApprovalCancellationAndScope() throws {
+        var event = try unwrap(CodexHook.parse(hook("PermissionRequest", input: ["command": "echo one"])))
+        event.notice?.codexClient = .desktop
+        var pending = PendingApprovalNotices()
+        checkTrue(pending.hold(event, now: 100))
+        checkEqual(pending.count, 1)
+        checkTrue(pending.takeReady(now: 104.999).isEmpty)
+        pending.resolve(key: "another-key")
+        checkEqual(pending.count, 1)
+        pending.resolve(key: event.key)
+        checkTrue(pending.takeReady(now: 110).isEmpty)
+
+        checkTrue(pending.hold(event, now: 200))
+        pending.clear(session: "another-session")
+        checkEqual(pending.count, 1)
+        pending.clear(session: event.sessionID) // Stop, Interrupt, end and user continuation.
+        checkTrue(pending.takeReady(now: 205).isEmpty)
+        checkTrue(pending.hold(event, now: 300))
+        pending.clear() // Pause, lock, sleep and explicit clear must not replay later.
+        checkTrue(pending.takeReady(now: 310).isEmpty)
+
+        event.notice?.codexClient = .cli
+        checkFalse(pending.hold(event, now: 400))
+        event.notice?.codexClient = .desktop
+        event.notice?.kind = .input
+        checkFalse(pending.hold(event, now: 400))
+        event.notice?.kind = .completion
+        checkFalse(pending.hold(event, now: 400))
+        event.notice?.kind = .notification
+        checkFalse(pending.hold(event, now: 400))
+        checkEqual(pending.count, 0)
+    }
+
+    func testDelayedApprovalDeadlineDuplicatesAndCapacity() throws {
+        var event = try unwrap(CodexHook.parse(hook("PermissionRequest", input: ["command": "echo one"])))
+        event.notice?.codexClient = .desktop
+        var pending = PendingApprovalNotices(capacity: 2)
+        checkTrue(pending.hold(event, now: 100))
+        checkTrue(pending.hold(event, now: 104))
+        let ready = pending.takeReady(now: 105)
+        checkEqual(ready.map(\.key), [event.key])
+        checkEqual(ready.first?.createdAt, event.createdAt)
+        checkEqual(ready.first?.notice, event.notice)
+        checkTrue(pending.takeReady(now: 106).isEmpty)
+
+        checkTrue(pending.hold(event, now: 200))
+        var second = event; second.key = "second"; second.notice?.id = second.key
+        var third = event; third.key = "third"; third.notice?.id = third.key
+        checkTrue(pending.hold(second, now: 201))
+        checkTrue(pending.hold(third, now: 202))
+        checkEqual(pending.count, 2)
+        checkTrue(pending.takeReady(now: 205).isEmpty)
+        checkEqual(pending.takeReady(now: 206).map(\.key), ["second"])
+        pending.resolve(key: "third") // A cancellation in the deadline's inbox batch wins.
+        checkTrue(pending.takeReady(now: 207).isEmpty)
     }
 
     func testInputAndAsyncInputLifecycle() throws {
@@ -292,17 +555,205 @@ final class NotificationCoreTests {
 
     func testCompactHookContentAndBackwardCompatibility() throws {
         let approval = try unwrap(CodexHook.parse(hook("PermissionRequest", input: ["justification": "运行构建检查", "command": "secret"])))
-        checkEqual(approval.notice?.title, "待审批")
+        checkEqual(approval.notice?.title, "审批请求")
         checkEqual(approval.notice?.body, "运行构建检查")
+        let described = try unwrap(CodexHook.parse(hook("PermissionRequest", input: ["description": "发布备份", "command": "secret"])))
+        checkEqual(described.notice?.body, "发布备份")
+        checkFalse(String(decoding: try JSONEncoder().encode(described), as: UTF8.self).contains("secret"))
         let generic = try unwrap(CodexHook.parse(hook("PermissionRequest", tool: "functions.exec_command")))
         checkEqual(generic.notice?.body, "exec_command")
         let question = try unwrap(CodexHook.parse(hook("PreToolUse", tool: "request_user_input_async", input: ["questions": [["title": "选择环境"], ["title": "选择区域"]]])))
         checkEqual(question.notice?.body, "选择环境\n选择区域")
         var legacy = try unwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(approval.notice)) as? [String: Any])
         legacy.removeValue(forKey: "tmux")
+        legacy.removeValue(forKey: "workingDirectory")
+        legacy.removeValue(forKey: "codexClient")
         let decoded = try JSONDecoder().decode(Notice.self, from: JSONSerialization.data(withJSONObject: legacy))
         checkNil(decoded.tmux)
+        checkNil(decoded.workingDirectory)
+        checkNil(decoded.codexClient)
         checkEqual(decoded.context, "project")
+    }
+
+    func testDesktopSessionMetadataIsReadOnlyAndFailsSafely() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("state_5.sqlite")
+        let session = "01a00000-0000-7000-8000-000000000001"
+        checkNil(CodexSessionContext.client(sessionID: session, databaseURL: path))
+        checkFalse(FileManager.default.fileExists(atPath: path.path))
+        var writer: OpaquePointer?
+        checkEqual(sqlite3_open(path.path, &writer), SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        func sql(_ query: String) {
+            checkEqual(sqlite3_exec(writer, query, nil, nil, nil), SQLITE_OK)
+        }
+        sql("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT, originator TEXT, thread_source TEXT)")
+        sql("INSERT INTO threads VALUES ('\(session)', 'vscode', 'Codex Desktop', 'user')")
+        let before = try Data(contentsOf: path)
+        checkEqual(CodexSessionContext.client(sessionID: session, databaseURL: path), .desktop)
+        checkEqual(try Data(contentsOf: path), before)
+        sql("UPDATE threads SET originator = 'codex-tui'")
+        // Both CLI and desktop can have source=vscode; originator separates them.
+        checkEqual(CodexSessionContext.client(sessionID: session, databaseURL: path), .cli)
+        sql("UPDATE threads SET originator = NULL, thread_source = 'automation'")
+        checkEqual(CodexSessionContext.client(sessionID: session, databaseURL: path), .desktop)
+        sql("UPDATE threads SET thread_source = 'user'")
+        checkNil(CodexSessionContext.client(sessionID: session, databaseURL: path))
+        checkNil(CodexSessionContext.client(sessionID: UUID().uuidString, databaseURL: path))
+        checkNil(CodexSessionContext.client(sessionID: "' OR 1=1 --", databaseURL: path))
+        sql("ALTER TABLE threads RENAME COLUMN originator TO old_originator")
+        checkNil(CodexSessionContext.client(sessionID: session, databaseURL: path))
+        checkEqual(CodexSessionContext.databaseURL(environment: [:], home: directory)?.path,
+                   directory.appendingPathComponent(".codex/state_5.sqlite").path)
+        checkEqual(CodexSessionContext.databaseURL(environment: ["CODEX_HOME": directory.path])?.path, path.path)
+        checkNil(CodexSessionContext.databaseURL(environment: ["CODEX_HOME": "relative/path"]))
+    }
+
+    func testCodexActionableRouting() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("state_5.sqlite")
+        let session = "01a00000-0000-7000-8000-000000000001"
+        let rollout = directory.appendingPathComponent("rollout-\(session).jsonl")
+        let payload: [String: Any] = ["hook_event_name": "Stop", "session_id": session,
+                                      "turn_id": "turn-1", "cwd": directory.path]
+        let raw = try unwrap(CodexHook.parse(JSONSerialization.data(withJSONObject: payload)))
+        // Title-generation Stop has no persisted thread, transcript or terminal destination.
+        checkNil(try unwrap(CodexSessionContext.route(raw, databaseURL: path, environment: [:])).notice)
+        checkFalse(FileManager.default.fileExists(atPath: path.path))
+        try Data().write(to: rollout)
+        checkNil(try unwrap(CodexSessionContext.route(raw, transcriptPath: rollout.path, databaseURL: path, environment: [:])).notice)
+        try Data("fixture transcript".utf8).write(to: rollout)
+        let fromHook = try unwrap(CodexSessionContext.route(raw, transcriptPath: rollout.path,
+                                                          databaseURL: path, environment: [:]))
+        checkEqual(fromHook.action, .complete)
+        checkNil(fromHook.notice)
+        checkEqual(fromHook.sessionID, session) // Completion still clears this session's earlier requests.
+        checkEqual(CodexSessionContext.resumeCommand(sessionID: session, transcriptPath: rollout.path,
+                                                     databaseURL: path, environment: [:]), "codex resume \(session)")
+        let customHome = directory.appendingPathComponent("account 'quoted'; $(literal)").path
+        checkEqual(CodexSessionContext.resumeCommand(sessionID: session, transcriptPath: rollout.path,
+                   databaseURL: nil, environment: ["CODEX_HOME": customHome]),
+                   "CODEX_HOME=\(TmuxBridge.shellQuote(customHome)) codex resume \(session)")
+        checkNil(CodexSessionContext.resumeCommand(sessionID: "'bad", transcriptPath: rollout.path, databaseURL: nil))
+        var writer: OpaquePointer?
+        checkEqual(sqlite3_open(path.path, &writer), SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        func sql(_ query: String) { checkEqual(sqlite3_exec(writer, query, nil, nil, nil), SQLITE_OK) }
+        sql("CREATE TABLE threads (id TEXT PRIMARY KEY, originator TEXT, thread_source TEXT, rollout_path TEXT)")
+        sql("INSERT INTO threads VALUES ('\(session)', 'codex-tui', 'user', '\(rollout.path)')")
+        let before = try Data(contentsOf: path)
+        let fromIndex = try unwrap(CodexSessionContext.route(raw, databaseURL: path, environment: [:]))
+        checkEqual(fromIndex.action, .complete)
+        checkNil(fromIndex.notice)
+        checkEqual(try Data(contentsOf: path), before)
+        var preferences = NotificationPreferences()
+        preferences.codexCompletion.retention.mode = .untilHandled
+        for kind in [Notice.Kind.approval, .input, .completion] {
+            // Older serialized inbox events must also be rejected even if every CLI policy is enabled.
+            var oldNotice = Notice(source: "Codex CLI", title: "提醒", body: "", kind: kind,
+                                   sessionID: session, codexClient: .cli, resumeCommand: "codex resume \(session)")
+            oldNotice = try JSONDecoder().decode(Notice.self, from: JSONEncoder().encode(oldNotice))
+            checkFalse(oldNotice.hasCodexDestination)
+            checkFalse(preferences.decision(for: oldNotice).show)
+            oldNotice.tmux = codexTmux
+            checkTrue(oldNotice.hasCodexDestination)
+            checkTrue(preferences.decision(for: oldNotice).show)
+        }
+        for (eventName, tool) in [("PermissionRequest", "Bash"), ("PreToolUse", "request_user_input")] {
+            let request = try unwrap(CodexHook.parse(JSONSerialization.data(withJSONObject:
+                ["hook_event_name": eventName, "session_id": session, "tool_name": tool])))
+            checkNil(CodexSessionContext.route(request, transcriptPath: rollout.path, databaseURL: path, environment: [:]))
+            checkTrue(CodexSessionContext.route(request, databaseURL: path, environment: [:], tmuxResolver: { _ in self.codexTmux }) != nil)
+        }
+        try FileManager.default.removeItem(at: rollout)
+        checkNil(try unwrap(CodexSessionContext.route(raw, databaseURL: path, environment: [:])).notice)
+        let tmux = TmuxContext(socketPath: "/tmp/test.sock", serverPID: 1, sessionID: "$1", windowID: "@1",
+                               paneID: "%1", sessionName: "test", windowName: "test", paneIndex: 0)
+        let live = try unwrap(CodexSessionContext.route(raw, databaseURL: path, environment: [:], tmuxResolver: { _ in tmux }))
+        checkEqual(live.notice?.tmux, tmux)
+        checkNil(live.notice?.resumeCommand)
+        try Data("fixture transcript".utf8).write(to: rollout)
+        let withFallback = try unwrap(CodexSessionContext.route(raw, databaseURL: path, environment: [:], tmuxResolver: { _ in tmux }))
+        checkEqual(withFallback.notice?.resumeCommand, "codex resume \(session)")
+        checkTrue(try unwrap(withFallback.notice).hasCodexDestination)
+        sql("UPDATE threads SET originator = 'Codex Desktop'")
+        let desktop = try unwrap(CodexSessionContext.route(raw, databaseURL: path, environment: [:], tmuxResolver: { _ in
+            checkTrue(false); return tmux
+        }))
+        checkEqual(desktop.notice?.codexClient, .desktop)
+        checkNil(desktop.notice?.tmux)
+        for action in [HookEvent.Action.resolve, .clearSession, .endSession] {
+            var end = raw; end.action = action; end.notice = nil
+            checkEqual(CodexSessionContext.route(end, databaseURL: nil)?.action, action)
+        }
+        sql("ALTER TABLE threads RENAME COLUMN originator TO old_originator")
+        // Unknown client metadata and a readable transcript are insufficient without direct navigation.
+        checkNil(try unwrap(CodexSessionContext.route(raw, transcriptPath: rollout.path, databaseURL: path, environment: [:])).notice)
+    }
+
+    func testDesktopThreadLinkAndNoticeRoundTrip() throws {
+        let session = "01a00000-0000-7000-8000-000000000001"
+        checkEqual(CodexSessionContext.desktopThreadURL(sessionID: session)?.absoluteString, "codex://threads/\(session)")
+        for invalid: String? in [nil, "", "new?prompt=run", "../settings", session + "?hostId=other"] {
+            checkNil(CodexSessionContext.desktopThreadURL(sessionID: invalid))
+        }
+        let notice = Notice(source: "Codex 桌面端", title: "审批请求", body: "发布备份", kind: .approval,
+                            sessionID: session, codexClient: .desktop)
+        checkEqual(try JSONDecoder().decode(Notice.self, from: JSONEncoder().encode(notice)), notice)
+        var preferences = NotificationPreferences()
+        checkFalse(preferences.decision(for: notice).show)
+        preferences.otherApps.mode = .untilHandled
+        let system = Notice(source: "ChatGPT", title: "提醒", body: "", bundleID: CodexSessionContext.desktopBundleID)
+        checkTrue(preferences.acceptsSource(system))
+        checkFalse(preferences.decision(for: system).show) // Other-app policy cannot re-enable desktop.
+        for kind in [Notice.Kind.approval, .input, .completion] {
+            var desktop = notice; desktop.kind = kind
+            checkFalse(preferences.decision(for: desktop).show)
+            preferences.codexDesktop = RetentionPolicy(seconds: 19)
+            checkTrue(preferences.decision(for: desktop).show)
+            checkEqual(preferences.decision(for: desktop).retention.duration, 19)
+            preferences.codexDesktop.mode = .disabled
+        }
+        preferences.codexDesktop.mode = .untilHandled
+        checkNil(preferences.decision(for: system).retention.duration)
+        checkTrue(preferences.decision(for: system).show)
+        preferences.codex.mode = .disabled
+        checkTrue(preferences.decision(for: notice).show)
+        var completion = notice; completion.kind = .completion
+        checkTrue(preferences.decision(for: completion).show)
+        preferences.codexCompletion.retention.mode = .untilHandled
+        preferences.codexCompletion.filterDirectories = true
+        preferences.codexCompletion.directories = [.init(path: "/work/learning")]
+        completion.workingDirectory = "/work/routine/AutoBackup"
+        checkTrue(preferences.decision(for: completion).show) // CLI directory filters are independent.
+        completion.workingDirectory = "/work/learning/project"
+        checkTrue(preferences.decision(for: completion).show)
+        completion.bundleID = "other.app"
+        preferences.otherApps.mode = .disabled
+        checkFalse(preferences.decision(for: completion).show)
+
+        let name = "notification-desktop-tests-" + UUID().uuidString
+        let defaults = try unwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        try preferences.save(to: defaults)
+        checkEqual(NotificationPreferences.load(from: defaults), preferences)
+        var legacy = try unwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(preferences)) as? [String: Any])
+        legacy.removeValue(forKey: "codexDesktop")
+        defaults.set(try JSONSerialization.data(withJSONObject: legacy), forKey: NotificationPreferences.defaultsKey)
+        let migrated = NotificationPreferences.load(from: defaults)
+        checkEqual(migrated.codexDesktop.mode, .disabled)
+        preferences.codexDesktop = RetentionPolicy(mode: .disabled)
+        checkEqual(migrated, preferences) // All existing fields survive an upgrade.
+        preferences.codexDesktop = RetentionPolicy(seconds: 0)
+        checkThrows(try preferences.save(to: defaults))
+        preferences.codexDesktop.seconds = 3601
+        checkThrows(try preferences.save(to: defaults))
+        preferences.codexDesktop.mode = .disabled
+        checkNil(preferences.validationError)
     }
 
     func testCommandTimeoutAndLiteralArguments() {
@@ -399,8 +850,115 @@ final class NotificationCoreTests {
         checkTrue(ProcessInfo.processInfo.systemUptime - start < 0.6)
     }
 
+    func testTmuxNavigationWithSuspendedPreferredClient() throws {
+        guard let bridge = TmuxBridge.installed() else { print("SKIP tmux client integration: tmux unavailable"); return }
+        let directory = URL(fileURLWithPath: "/tmp/notification-clients-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let socket = directory.appendingPathComponent("socket").path
+        defer {
+            _ = LocalCommand.run(bridge.executable, ["-S", socket, "kill-server"])
+            try? FileManager.default.removeItem(at: directory)
+        }
+        func run(_ arguments: [String]) throws -> String {
+            try unwrap(LocalCommand.run(bridge.executable, ["-u", "-S", socket] + arguments, timeout: 1))
+        }
+        _ = try run(["-f", "/dev/null", "new-session", "-d", "-s", "visible", "/bin/sleep 60"])
+        let identity = try run(["display-message", "-p", "#{pid}|#{session_id}|#{pane_pid}"]).trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "|")
+        guard identity.count == 3 else { throw TmuxError.unavailable }
+        let panePID = try unwrap(Int32(identity[2]))
+        let context = try unwrap(bridge.capture(environment: ["TMUX": "\(socket),\(identity[0]),0"], processID: panePID))
+        var terminals: [(Int32, Int32)] = []
+        var clients: [Process] = []
+        defer {
+            for client in clients {
+                if client.isRunning { _ = Darwin.kill(client.processIdentifier, SIGKILL) }
+                client.waitUntilExit()
+            }
+            for (master, slave) in terminals { Darwin.close(master); Darwin.close(slave) }
+        }
+        func attach(_ session: String, command: String? = nil) throws -> TmuxAttachedClient {
+            var master: Int32 = -1; var slave: Int32 = -1
+            var size = winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0)
+            guard openpty(&master, &slave, nil, nil, &size) == 0 else { throw TmuxError.unavailable }
+            terminals.append((master, slave))
+            let handle = FileHandle(fileDescriptor: slave, closeOnDealloc: false)
+            let process = Process(); process.executableURL = bridge.executable
+            process.arguments = ["-S", socket, "attach-session", "-t", session]
+            if let command {
+                process.executableURL = URL(fileURLWithPath: "/bin/sh")
+                process.arguments = ["-c", "exec \(command)"]
+            }
+            var environment = ProcessInfo.processInfo.environment
+            environment.removeValue(forKey: "TMUX"); environment.removeValue(forKey: "TMUX_PANE")
+            environment["TERM"] = "xterm-256color"; process.environment = environment
+            process.standardInput = handle; process.standardOutput = handle; process.standardError = handle
+            try process.run(); clients.append(process)
+            for _ in 0..<25 {
+                if let client = bridge.attachedClients(for: context).first(where: { $0.pid == process.processIdentifier }) { return client }
+                usleep(20_000)
+            }
+            throw TmuxError.clientChanged
+        }
+        let visible = try attach("visible", command: try unwrap(bridge.attachCommand(for: context)))
+        _ = try run(["set-option", "-g", "focus-events", "on"])
+        _ = try run(["set-option", "-as", "terminal-features", ",xterm*:focus"])
+        // Real PTY focus reports, isolated from the user's terminal and tmux server.
+        func focus(_ sequence: String, terminal: Int) throws {
+            let data = Data(sequence.utf8)
+            let written = data.withUnsafeBytes { Darwin.write(terminals[terminal].0, $0.baseAddress, $0.count) }
+            checkEqual(written, data.count)
+            usleep(50_000)
+        }
+        try focus("\u{1b}[I", terminal: 0)
+        checkTrue(bridge.isInForegroundWindow(context, foregroundProcessID: visible.pid))
+        checkFalse(bridge.isInForegroundWindow(context, foregroundProcessID: panePID))
+        let sibling = try run(["split-window", "-d", "-t", context.paneID, "-P", "-F", "#{pane_pid}", "/bin/sleep 60"])
+        let siblingPID = try unwrap(Int32(sibling.trimmingCharacters(in: .whitespacesAndNewlines)))
+        let siblingContext = try unwrap(bridge.capture(environment: ["TMUX": "\(socket),\(identity[0]),0"], processID: siblingPID))
+        checkNotEqual(siblingContext.paneID, context.paneID)
+        checkTrue(bridge.isInForegroundWindow(siblingContext, foregroundProcessID: visible.pid))
+        _ = try run(["new-window", "-t", context.sessionID, "/bin/sleep 60"])
+        checkFalse(bridge.isInForegroundWindow(context, foregroundProcessID: visible.pid))
+        _ = try run(["select-window", "-t", context.windowID])
+        try focus("\u{1b}[O", terminal: 0)
+        checkFalse(bridge.isInForegroundWindow(context, foregroundProcessID: visible.pid))
+        try focus("\u{1b}[I", terminal: 0)
+        _ = try run(["set-option", "-g", "focus-events", "off"])
+        checkFalse(bridge.isInForegroundWindow(context, foregroundProcessID: visible.pid))
+        _ = try run(["set-option", "-g", "focus-events", "on"])
+        _ = try run(["new-session", "-d", "-s", "suspended", "/bin/sleep 60"])
+        let hidden = try attach("suspended")
+        checkFalse(bridge.isInForegroundWindow(context, foregroundProcessID: getpid())) // Ambiguous focused clients.
+        try focus("\u{1b}[O", terminal: 1)
+        checkTrue(bridge.isInForegroundWindow(context, foregroundProcessID: getpid()))
+        checkFalse(bridge.isInForegroundWindow(context, foregroundProcessID: hidden.pid))
+        _ = try run(["suspend-client", "-t", hidden.name])
+        usleep(50_000)
+        checkFalse(bridge.attachedClients(for: context).contains { $0.pid == hidden.pid })
+        checkFalse(bridge.isInForegroundWindow(context, foregroundProcessID: hidden.pid))
+        // The implicit current client can be hidden, even with a usable visible client.
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "TMUX"); environment.removeValue(forKey: "TMUX_PANE")
+        let implicit = LocalCommand.run(bridge.executable, ["-u", "-S", socket, "display-message", "-p", "#{client_pid}"], environment: environment)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        checkEqual(implicit, String(hidden.pid))
+        try bridge.switchClient(visible, to: context)
+        checkEqual(bridge.attachedClients(for: context).first { $0.pid == visible.pid }?.sessionID, context.sessionID)
+        checkThrows(try bridge.switchClient(hidden, to: context))
+    }
+
     func testTmuxCaptureNavigationAndStaleTargetsOnIsolatedServer() throws {
         guard let bridge = TmuxBridge.installed() else { print("SKIP isolated tmux integration: tmux unavailable"); return }
+        // Match a menu-bar app's non-UTF-8 launch environment, including client parsing.
+        let localeKeys = ["LANG", "LC_CTYPE", "LC_ALL"]
+        let savedLocale = ProcessInfo.processInfo.environment
+        for key in localeKeys { unsetenv(key) }
+        setenv("LC_ALL", "C", 1)
+        defer {
+            for key in localeKeys {
+                if let value = savedLocale[key] { setenv(key, value, 1) }
+                else { unsetenv(key) }
+            }
+        }
         let directory = URL(fileURLWithPath: "/tmp/notification tests,'\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let socket = directory.appendingPathComponent("socket").path
@@ -409,7 +967,7 @@ final class NotificationCoreTests {
             try? FileManager.default.removeItem(at: directory)
         }
         func run(_ arguments: [String]) throws -> String {
-            guard let output = LocalCommand.run(bridge.executable, ["-S", socket] + arguments, timeout: 1) else {
+            guard let output = LocalCommand.run(bridge.executable, ["-u", "-S", socket] + arguments, timeout: 1) else {
                 throw NSError(domain: "CoreChecks", code: 2, userInfo: [NSLocalizedDescriptionKey: "tmux failed: \(arguments)"])
             }
             return output
@@ -417,6 +975,7 @@ final class NotificationCoreTests {
         _ = try run(["-f", "/dev/null", "new-session", "-d", "-s", "unit-session", "-n", "work 'quoted'; literal", "/bin/sleep 60"])
         let identity = try run(["display-message", "-p", "#{pid}\n#{session_id}\n#{pane_id}"]).split(separator: "\n").map(String.init)
         checkEqual(identity.count, 3)
+        guard identity.count == 3 else { throw TmuxError.unavailable }
         let environment = ["TMUX": "\(socket),\(identity[0]),\(identity[1].dropFirst())", "TMUX_PANE": identity[2]]
         let panePID = try unwrap(Int32(try run(["display-message", "-p", "-t", identity[2], "#{pane_pid}"]).trimmingCharacters(in: .whitespacesAndNewlines)))
         let original = try unwrap(bridge.capture(environment: environment, processID: panePID))
@@ -428,12 +987,12 @@ final class NotificationCoreTests {
         checkNil(bridge.capture(environment: [:]))
         // A daemon outside the pane must never inherit a false origin from TMUX_PANE.
         checkNil(bridge.capture(environment: environment, processID: 1))
-        _ = try run(["rename-window", "-t", original.windowID, "renamed"])
+        _ = try run(["rename-window", "-t", original.windowID, "renamed 中文"])
         let other = try run(["split-window", "-d", "-t", original.paneID, "-P", "-F", "#{pane_id}", "/bin/sleep 60"]).trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try run(["select-pane", "-t", other])
         _ = try run(["new-window", "-t", original.sessionID, "-n", "other-window", "/bin/sleep 60"])
         let selected = try bridge.select(original)
-        checkEqual(selected.windowName, "renamed")
+        checkEqual(selected.windowName, "renamed 中文")
         checkEqual(try run(["display-message", "-p", "-t", original.sessionID, "#{pane_id}"]).trimmingCharacters(in: .whitespacesAndNewlines), original.paneID)
         checkTrue(bridge.attachedClients(for: selected).isEmpty)
         let command = try unwrap(bridge.attachCommand(for: selected))
@@ -469,6 +1028,42 @@ final class NotificationCoreTests {
         checkNotEqual(attached.sessionID, selected.sessionID)
         try bridge.switchClient(attached, to: selected)
         checkEqual(bridge.attachedClients(for: selected).first { $0.pid == attached.pid }?.sessionID, selected.sessionID)
+
+        // A suspended old attachment and its replacement share the same tty. Explicit
+        // switch-client -c resolves the hidden old client and reports success, leaving
+        // the visible replacement unchanged. This is the real notification regression.
+        _ = try run(["suspend-client", "-t", attached.name])
+        usleep(50_000)
+        checkEqual(Darwin.kill(clientProcess.processIdentifier, SIGSTOP), 0)
+        let replacementProcess = Process()
+        replacementProcess.executableURL = bridge.executable
+        replacementProcess.arguments = ["-S", socket, "attach-session", "-t", "other-session"]
+        replacementProcess.environment = clientEnvironment
+        replacementProcess.standardInput = terminal
+        replacementProcess.standardOutput = terminal
+        replacementProcess.standardError = terminal
+        try replacementProcess.run()
+        defer {
+            if replacementProcess.isRunning { _ = Darwin.kill(replacementProcess.processIdentifier, SIGKILL) }
+            replacementProcess.waitUntilExit()
+        }
+        var replacement: TmuxAttachedClient?
+        for _ in 0..<25 {
+            replacement = bridge.attachedClients(for: selected).first { $0.pid == replacementProcess.processIdentifier }
+            if replacement != nil { break }
+            usleep(20_000)
+        }
+        let foreground = try unwrap(replacement)
+        checkEqual(foreground.name, attached.name)
+        checkNotEqual(foreground.sessionID, selected.sessionID)
+        _ = try run(["switch-client", "-c", foreground.name, "-t", selected.sessionID])
+        checkEqual(bridge.attachedClients(for: selected).first { $0.pid == foreground.pid }?.sessionID, foreground.sessionID)
+        checkEqual(bridge.attachedClients(for: selected).first?.pid, foreground.pid)
+        checkThrows(try bridge.switchClient(attached, to: selected))
+        try bridge.switchClient(foreground, to: selected)
+        checkEqual(bridge.attachedClients(for: selected).first { $0.pid == foreground.pid }?.sessionID, selected.sessionID)
+        let destinations = try run(["list-clients", "-F", "#{client_pid}|#{session_id}|#{window_id}|#{pane_id}"])
+        checkTrue(destinations.contains("\(foreground.pid)|\(selected.sessionID)|\(selected.windowID)|\(selected.paneID)"))
         var invalid = original; invalid.paneID = "%0; display-message injected"
         checkNil(bridge.attachCommand(for: invalid))
         var stale = original; stale.serverPID += 1
@@ -518,6 +1113,20 @@ final class NotificationCoreTests {
         _ = try run(["kill-pane", "-t", original.paneID])
         checkNil(bridge.refreshed(original))
         checkThrows(try bridge.select(original))
+
+        // Restart the same socket, reuse old pane IDs, and resume the Codex thread
+        // in a different pane. An inherited TMUX value still names the old PID.
+        _ = try run(["kill-server"])
+        _ = try run(["-f", "/dev/null", "new-session", "-d", "-s", "after-restart", "/bin/sleep 60"])
+        let resumed = try run(["new-window", "-d", "-n", "resumed", "-P", "-F", "#{pane_id}", "\(TmuxBridge.shellQuote(fakeCLI.path)) 60"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try run(["select-pane", "-t", resumed, "-T", "project | \(thread)"])
+        let recovered = try unwrap(bridge.capture(sessionID: thread, environment: environment, processID: 1))
+        checkEqual(recovered.paneID, resumed)
+        checkNotEqual(recovered.serverPID, original.serverPID)
+        checkEqual(bridge.refreshed(remoteContext)?.paneID, resumed)
+        checkNil(bridge.refreshed(original)) // A recycled %0 is not the original shell.
+        _ = try run(["kill-pane", "-t", resumed])
+        checkNil(bridge.refreshed(remoteContext)) // Never fall back to a recycled ID.
     }
 }
 
@@ -565,17 +1174,29 @@ private func unwrap<T>(_ value: T?, file: StaticString = #filePath, line: UInt =
             ("cross-source pairing preserves repeated messages", suite.testSystemReceiptPairsPreserveRepeatedMessages),
             ("database baseline and repeated identities do not replay", suite.testDatabaseBaselineAndRepeatedIdentitiesDoNotReplay),
             ("preferences defaults, persistence and validation", suite.testPreferencesDefaultsPersistenceAndValidation),
+            ("foreground tmux preference and legacy settings", suite.testForegroundTmuxPreferenceAndLegacySettings),
             ("Feishu classification and independent retention", suite.testFeishuClassificationAndIndependentRetention),
             ("Feishu message filters and category boundary", suite.testFeishuMessageFiltersAndClassificationBoundary),
+            ("other applications are opt-in and retain source boundaries", suite.testOnlyConfiguredApplicationsAreAllowed),
+            ("disabled policies and independent configuration persistence", suite.testDisabledPoliciesOverrideFiltersAndPersistIndependently),
+            ("completion directory boundaries, multiple roots and symlinks", suite.testCompletionDirectoryFiltersRespectBoundariesAndAliases),
+            ("completion hook lifecycle and payload minimization", suite.testCompletionHookLifecycleAndPayloadMinimization),
             ("approval lifecycle and payload minimization", suite.testApprovalLifecycleDoesNotStoreCommand),
+            ("Bash approval description and execution resolution", suite.testBashApprovalDescriptionDoesNotBreakResolution),
+            ("desktop approval delay, cancellation and source boundaries", suite.testDelayedDesktopApprovalCancellationAndScope),
+            ("desktop approval deadline, duplicate receipts and bounded capacity", suite.testDelayedApprovalDeadlineDuplicatesAndCapacity),
             ("sync and async input lifecycle", suite.testInputAndAsyncInputLifecycle),
             ("inbox expiry, permissions, consume once", suite.testInboxDiscardsExpiredEventsAndConsumesOnce),
             ("project labels and managed path boundaries", suite.testProjectLabelsRespectManagedBoundaryAndRepositoryRoots),
             ("compact content and legacy event decoding", suite.testCompactHookContentAndBackwardCompatibility),
+            ("read-only desktop metadata, client boundaries and schema fallback", suite.testDesktopSessionMetadataIsReadOnlyAndFailsSafely),
+            ("desktop thread links and event round trip", suite.testDesktopThreadLinkAndNoticeRoundTrip),
+            ("Codex actionable routing and persisted resume commands", suite.testCodexActionableRouting),
             ("local command timeout and literal arguments", suite.testCommandTimeoutAndLiteralArguments),
             ("WAL writes wake source reads without fallback", suite.testSourceMonitorWakesOnWALCommitsWithoutWaitingForFallback),
             ("source monitor late creation, replacement and fallback", suite.testSourceMonitorHandlesLateFilesReplacementAndFallback),
-            ("isolated tmux capture, navigation, rename and stale pane", suite.testTmuxCaptureNavigationAndStaleTargetsOnIsolatedServer)
+            ("isolated tmux capture, navigation, rename and stale pane", suite.testTmuxCaptureNavigationAndStaleTargetsOnIsolatedServer),
+            ("tmux navigation with suspended preferred client", suite.testTmuxNavigationWithSuspendedPreferredClient)
         ]
         for (name, test) in tests {
             let before = failures

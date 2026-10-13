@@ -1,7 +1,9 @@
 import AppKit
 import NotificationCore
+import OSLog
 
 enum TmuxNavigator {
+    private static let log = Logger(subsystem: "me.leiguoguo.notification", category: "Navigation")
     static func open(_ context: TmuxContext, completion: @escaping (String?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -26,11 +28,20 @@ enum TmuxNavigator {
                             do {
                                 try bridge.switchClient(client, to: current)
                                 DispatchQueue.main.async {
-                                    if terminal.activate(options: [.activateIgnoringOtherApps]) { completion(nil) }
+                                    if terminal.activate(options: [.activateIgnoringOtherApps]) {
+                                        log.info("tmux switched client=\(client.pid) server=\(current.serverPID)")
+                                        completion(nil)
+                                    }
                                     else { launchTerminal(bridge: bridge, context: current, completion: completion) }
                                 }
-                            } catch {
+                            } catch TmuxError.clientChanged {
+                                // A restored/suspended attachment cannot always be addressed
+                                // uniquely. Open a fresh attachment instead of a permanent retry loop.
+                                log.info("tmux client unavailable; opening a fresh attachment")
                                 DispatchQueue.main.async { launchTerminal(bridge: bridge, context: current, completion: completion) }
+                            } catch {
+                                log.error("tmux switch failed")
+                                DispatchQueue.main.async { completion(error.localizedDescription) }
                             }
                         }
                     } else {
@@ -38,6 +49,7 @@ enum TmuxNavigator {
                     }
                 }
             } catch {
+                log.error("tmux destination unavailable")
                 DispatchQueue.main.async { completion(error.localizedDescription) }
             }
         }
